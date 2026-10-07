@@ -165,22 +165,29 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         }
     }
     let log_path = workdir.join("iso-build.log");
-    let bake_spin = output::spinner::spin("baking ISO");
 
     // 5a. Docker daemon probe. Informational only: omarchy-iso-make retries
     // with sudo, which may prompt interactively where our probe cannot.
-    bake_spin.set_detail("checking docker daemon");
     probe_docker();
 
-    // 5b. Explicit base-image pull so the biggest download shows progress
+    // 5b. Pre-authorize sudo while the terminal is clean. Without this, the
+    // `sudo docker` fallback inside omarchy-iso-make would print its password
+    // prompt into the redirected build log (invisible) or mid-spinner-line.
+    ensure_docker_elevation();
+
+    let bake_spin = output::spinner::spin("baking ISO");
+
+    // 5c. Explicit base-image pull so the biggest download shows progress
     // instead of hiding inside the container run. Best effort: the build
     // retries (possibly elevated) on its own.
     bake_spin.set_detail("pulling archlinux/archlinux:latest");
-    pre_pull(&bake_spin, &log_path);
+    if !pre_pull(&bake_spin, &log_path) {
+        bake_spin.set_detail("base pull deferred — retrying inside build");
+    }
 
-    // 5c. The bake. Output always lands in the log (the watcher below needs
+    // 5d. The bake. Output always lands in the log (the watcher below needs
     // it); verbose mode additionally streams it live.
-    bake_spin.set_detail(&format!("building (log: {})", log_path.display()));
+    bake_spin.advance(&format!("building (log: {})", log_path.display()));
     let log_file = std::fs::File::create(&log_path)
         .map_err(|e| format!("cannot create build log: {e}"))?;
     let mut cmd = std::process::Command::new(checkout.join("bin/omarchy-iso-make"));
@@ -304,21 +311,22 @@ fn probe_docker() {
 }
 
 /// Explicit base-image pull so the biggest download gets its own progress
-/// instead of hiding inside the container run. Best effort.
-fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path) {
+/// instead of hiding inside the container run. Best effort: returns false
+/// when the pull failed (the build retries, possibly elevated).
+fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path) -> bool {
     if output::is_quiet() {
         let log = match std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
             Ok(f) => f,
             Err(e) => {
                 output::warn(&format!("cannot open build log: {e}"));
-                return;
+                return false;
             }
         };
         let err_log = match log.try_clone() {
             Ok(f) => f,
             Err(e) => {
                 output::warn(&format!("log redirect failed: {e}"));
-                return;
+                return false;
             }
         };
         let r = std::process::Command::new("docker")
@@ -327,18 +335,44 @@ fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path) {
             .stderr(err_log)
             .status();
         match r {
-            Ok(s) if s.success() => output::info("base image ready"),
-            _ => output::warn("base image pull failed; continuing (the build retries)"),
+            Ok(s) if s.success() => {
+                output::info("base image ready");
+                true
+            }
+            _ => {
+                output::warn("base image pull failed; continuing (the build retries)");
+                false
+            }
         }
+    } else {
+        let _paused = spin.pause();
+        let r = std::process::Command::new("docker")
+            .args(["pull", "archlinux/archlinux:latest"])
+            .status();
+        match r {
+            Ok(s) if s.success() => true,
+            _ => {
+                output::warn("base image pull failed; continuing (the build retries)");
+                false
+            }
+        }
+    }
+}
+
+/// Pre-authorize sudo on a clean terminal line, before any spinner or log
+/// redirection is active. Otherwise the `sudo docker` fallback would print
+/// its password prompt into the build log (invisible) or mid-animation.
+fn ensure_docker_elevation() {
+    if system::run("docker", &["version"]).map(|r| r.status == 0).unwrap_or(false) {
         return;
     }
-    let _paused = spin.pause();
-    let r = std::process::Command::new("docker")
-        .args(["pull", "archlinux/archlinux:latest"])
-        .status();
-    match r {
-        Ok(s) if s.success() => {}
-        _ => output::warn("base image pull failed; continuing (the build retries)"),
+    output::info("docker needs elevation — one password prompt, then the bake runs unattended");
+    // Inherited stdio on purpose: sudo must talk to the real terminal.
+    match std::process::Command::new("sudo").arg("-v").status() {
+        Ok(s) if s.success() => output::info("sudo authorized"),
+        _ => output::warn(
+            "could not pre-authorize sudo; if the build stalls, it is waiting on a hidden password prompt",
+        ),
     }
 }
 
@@ -400,10 +434,11 @@ fn pump_log(
             let line: String = pending.drain(..=pos).collect();
             let line = line.trim_end();
             if verbose && !line.trim().is_empty() {
+                output::spinner::clear_active();
                 println!("{line}");
             }
             if let Some(detail) = bake_detail(line) {
-                spin.set_detail(detail);
+                spin.advance(detail);
             }
         }
         match child.try_wait() {
@@ -417,10 +452,11 @@ fn pump_log(
                         let _ = f.read_to_string(&mut rest);
                         for line in rest.lines() {
                             if verbose && !line.trim().is_empty() {
+                                output::spinner::clear_active();
                                 println!("{line}");
                             }
                             if let Some(detail) = bake_detail(line) {
-                                spin.set_detail(detail);
+                                spin.advance(detail);
                             }
                         }
                     }
