@@ -1,0 +1,16 @@
+[package]
+name = "omarchy-recipe"
+version = "0.2.0"
+edition = "2021"
+description = "Make Omarchy configs portable: export/import .recipe bundles, bake custom ISOs"
+license = "MIT"
+
+[[bin]]
+name = "omarchy-recipe"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"

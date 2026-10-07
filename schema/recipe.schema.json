@@ -1,0 +1,136 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "omarchy-recipe v2",
+  "description": "Portable Omarchy machine recipe: package/theme/service pointers + dotfiles tarball hash. Reads v1, writes v2.",
+  "type": "object",
+  "required": ["schema_version", "generated_by", "generated_at", "omarchy", "packages", "dotfiles"],
+  "properties": {
+    "schema_version": { "type": "integer", "enum": [1, 2] },
+    "generated_by": { "type": "string" },
+    "generated_at": { "type": "string" },
+    "omarchy": {
+      "type": "object",
+      "required": ["version", "channel", "ref"],
+      "properties": {
+        "version": { "type": "string" },
+        "channel": { "type": "string" },
+        "ref": { "type": "string" },
+        "remote": { "type": "string" }
+      }
+    },
+    "packages": {
+      "type": "object",
+      "required": ["explicit_repo", "aur"],
+      "properties": {
+        "explicit_repo": { "type": "array", "items": { "type": "string" } },
+        "aur": { "type": "array", "items": { "type": "string" } },
+        "aur_mode": { "type": "string", "enum": ["wifi", "vendored"], "default": "wifi" }
+      }
+    },
+    "aur_vendored": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "file"],
+        "properties": {
+          "name": { "type": "string" },
+          "file": { "type": "string" }
+        }
+      }
+    },
+    "selection": {
+      "type": "object",
+      "properties": {
+        "excluded_sections": {
+          "type": "array",
+          "items": { "type": "string", "enum": ["packages", "aur", "themes", "font", "plugins", "services", "webapps", "backgrounds", "icons"] }
+        },
+        "extra_excludes": { "type": "array", "items": { "type": "string" } },
+        "include_secrets": { "type": "boolean", "default": false }
+      }
+    },
+    "themes": {
+      "type": "object",
+      "required": ["installed"],
+      "properties": {
+        "current": { "type": ["string", "null"] },
+        "installed": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "source"],
+            "properties": {
+              "name": { "type": "string" },
+              "source": { "type": "string", "enum": ["bundled", "custom"] },
+              "url": { "type": ["string", "null"] },
+              "ref": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "background": {
+          "type": "object",
+          "properties": {
+            "current": { "type": ["string", "null"] },
+            "bundled_in_dotfiles": { "type": "boolean" }
+          }
+        }
+      }
+    },
+    "font": {
+      "type": "object",
+      "properties": {
+        "monospace": { "type": ["string", "null"] }
+      }
+    },
+    "plugins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "enabled"],
+        "properties": {
+          "id": { "type": "string" },
+          "enabled": { "type": "boolean" },
+          "firstParty": { "type": "boolean" },
+          "url": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "services": {
+      "type": "object",
+      "properties": {
+        "user": { "type": "array", "items": { "type": "string" } },
+        "system": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "webapps": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name"],
+        "properties": {
+          "name": { "type": "string" },
+          "url": { "type": ["string", "null"] },
+          "icon": { "type": ["string", "null"] },
+          "desktop_file": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "shell": {
+      "type": "object",
+      "properties": {
+        "bar_layout_sha256": { "type": ["string", "null"] },
+        "restored_via_dotfiles": { "type": "boolean" }
+      }
+    },
+    "dotfiles": {
+      "type": "object",
+      "required": ["file", "sha256"],
+      "properties": {
+        "file": { "type": "string" },
+        "sha256": { "type": "string" },
+        "includes": { "type": "array", "items": { "type": "string" } },
+        "excludes": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

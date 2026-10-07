@@ -1,0 +1,15 @@
+[Unit]
+Description=Apply omarchy-recipe machine recipe (first boot)
+Wants=network-online.target
+After=network-online.target omarchy-provision-owner.service
+ConditionPathExists=/var/lib/omarchy/recipe/recipe.json
+
+[Service]
+# Type=simple so boot (SDDM included) is never held hostage: the applier
+# retries network-dependent steps internally, and the unit stays enabled
+# across boots until one run fully succeeds, then disables itself.
+Type=simple
+ExecStart=/usr/local/bin/omarchy-recipe import /var/lib/omarchy/recipe --yes --first-boot
+
+[Install]
+WantedBy=multi-user.target
