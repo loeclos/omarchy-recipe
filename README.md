@@ -39,8 +39,9 @@ omarchy-recipe build-iso --mirror edge
 omarchy-recipe build-iso ./my-machine.recipe --mirror edge --dry-run
 omarchy-recipe build-iso ./airgap.recipe --mirror stable
 
-# Verbose mode: full detail (default shows stages, warnings and the end summary;
-# docker output streams to <workdir>/iso-build.log unless verbose)
+# Verbose mode: full detail (default shows animated stage spinners, warnings
+# and the end summary; docker output streams to <workdir>/iso-build.log
+# unless verbose, while the spinner tracks bake phases live)
 omarchy-recipe --verbose build-iso ./my-machine.recipe --mirror edge
 ```
 

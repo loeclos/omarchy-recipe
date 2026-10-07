@@ -125,11 +125,14 @@ fn build_pkg(pkg: &str, dest: &Path) -> Result<String, String> {
     }
 
     output::info(&format!("Building {pkg} (makepkg -sf; sudo may prompt for deps) ..."));
+    let build_spin = output::spinner::spin(&format!("building {pkg}"));
     let r = system::run_in(&srcdir, "makepkg", &["--noconfirm", "-sf"])?;
     if r.status != 0 {
+        build_spin.fail(&format!("makepkg failed for {pkg}"));
         std::fs::remove_dir_all(&work).ok();
         return Err(format!("makepkg failed for '{pkg}': {}", tail(&r.stderr)));
     }
+    build_spin.succeed(None);
     // Collect exactly this package's artifacts (split packages possible).
     let mut built: Vec<PathBuf> = std::fs::read_dir(&srcdir)
         .map_err(|e| format!("cannot list build dir: {e}"))?

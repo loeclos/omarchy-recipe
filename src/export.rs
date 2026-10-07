@@ -172,7 +172,18 @@ pub fn run(opts: ExportOptions) -> Result<(), String> {
     }
     let excludes = build_excludes(&opts.without, &opts.extra_excludes, opts.include_secrets);
     let tarball = out.join("dotfiles.tar.zst");
-    archive_dotfiles(&home, &tarball, &excludes, skipped(&opts.without, "icons"), opts.include_secrets)?;
+    let tar_spin = output::spinner::spin("compressing dotfiles");
+    if let Err(e) = archive_dotfiles(
+        &home,
+        &tarball,
+        &excludes,
+        skipped(&opts.without, "icons"),
+        opts.include_secrets,
+    ) {
+        tar_spin.fail("dotfiles archive failed");
+        return Err(e);
+    }
+    tar_spin.succeed(None);
     let tarball_sha = sha256_file(&tarball)?;
 
     // --- AUR vendoring ---
@@ -186,7 +197,17 @@ pub fn run(opts: ExportOptions) -> Result<(), String> {
         if aur.is_empty() {
             output::info("AUR vendoring requested but no AUR packages installed; nothing to vendor");
         } else {
-            aur_vendored = crate::aur::vendor(&aur, &out, opts.aur_pkgdir.as_deref())?;
+            let vend_spin = output::spinner::spin("building AUR packages");
+            match crate::aur::vendor(&aur, &out, opts.aur_pkgdir.as_deref()) {
+                Ok(v) => {
+                    vend_spin.succeed(None);
+                    aur_vendored = v;
+                }
+                Err(e) => {
+                    vend_spin.fail("AUR vendoring failed");
+                    return Err(e);
+                }
+            }
         }
     }
 

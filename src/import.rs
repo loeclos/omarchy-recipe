@@ -218,19 +218,26 @@ fn install_aur_wifi(aur: &[&str], first_boot: bool) -> Result<(), String> {
     let mut args = vec!["-S", "--noconfirm", "--needed", "--"];
     args.extend(aur.iter().copied());
     if !first_boot {
+        let spin = output::spinner::spin("installing AUR packages");
         let r = system::run(helper, &args)?;
         if r.status != 0 {
+            spin.fail("some AUR packages failed");
             output::warn("some AUR packages failed (see above)");
+        } else {
+            spin.succeed(None);
         }
         return Ok(());
     }
+    let spin = output::spinner::spin("installing AUR packages (waiting for network)");
     let attempts = std::env::var("OMARCHY_RECIPE_NET_RETRIES")
         .ok()
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(120);
     for i in 1..=attempts {
+        spin.set_detail(&format!("AUR install attempt {i}/{attempts}"));
         let r = system::run(helper, &args)?;
         if r.status == 0 {
+            spin.succeed(None);
             return Ok(());
         }
         if i == attempts {
@@ -241,29 +248,32 @@ fn install_aur_wifi(aur: &[&str], first_boot: bool) -> Result<(), String> {
         ));
         std::thread::sleep(std::time::Duration::from_secs(15));
     }
+    spin.fail("AUR install gave up");
     Err("AUR install failed after retries; unit stays enabled for next boot".into())
 }
 
 fn install_repo_packages(pkgs: &[&str]) -> Result<(), String> {
     output::info(&format!("Installing {} repo packages ...", pkgs.len()));
-    if system::cmd_exists("omarchy-pkg-add") {
-        let r = system::run("omarchy-pkg-add", pkgs)?;
-        if r.status != 0 {
-            output::warn("some repo packages failed (see above)");
-        }
-        return Ok(());
-    }
-    let mut args: Vec<&str> = vec!["-S", "--noconfirm", "--needed", "--"];
-    args.extend(pkgs.iter().copied());
-    let r = if is_root() {
-        system::run("pacman", &args)?
+    let spin = output::spinner::spin("installing repo packages");
+    let status = if system::cmd_exists("omarchy-pkg-add") {
+        system::run("omarchy-pkg-add", pkgs)?.status
     } else {
-        let mut sudo_args = vec!["pacman"];
-        sudo_args.extend(args);
-        system::run("sudo", &sudo_args)?
+        let mut args: Vec<&str> = vec!["-S", "--noconfirm", "--needed", "--"];
+        args.extend(pkgs.iter().copied());
+        let r = if is_root() {
+            system::run("pacman", &args)?
+        } else {
+            let mut sudo_args = vec!["pacman"];
+            sudo_args.extend(args);
+            system::run("sudo", &sudo_args)?
+        };
+        r.status
     };
-    if r.status != 0 {
+    if status != 0 {
+        spin.fail("some repo packages failed");
         output::warn("some repo packages failed (see above)");
+    } else {
+        spin.succeed(None);
     }
     Ok(())
 }
@@ -338,6 +348,7 @@ fn restore_dotfiles(
     }
     let stage = std::env::temp_dir().join(format!("omarchy-recipe-stage-{}", std::process::id()));
     std::fs::create_dir_all(&stage).map_err(|e| format!("cannot create stage: {e}"))?;
+    let extract_spin = output::spinner::spin("extracting dotfiles");
     let r = system::run_in(
         &stage,
         "tar",
@@ -347,9 +358,11 @@ fn restore_dotfiles(
     if r.status != 0 {
         let r2 = system::run_in(&stage, "tar", &["-xf", &tarball.to_string_lossy()])?;
         if r2.status != 0 {
+            extract_spin.fail("dotfiles extraction failed");
             return Err(format!("cannot extract tarball: {}", r2.stderr.trim()));
         }
     }
+    extract_spin.succeed(None);
 
     // Never clobber this machine's monitor layout with machine A's.
     for mon in ["hypr/monitors.conf", "hypr/monitors"] {
@@ -371,6 +384,7 @@ fn restore_dotfiles(
     // rsync --backup keeps per-file pre-recipe copies; cp fallback otherwise.
     let stage_s = format!("{}/", stage.display());
     let home_s = home.to_string_lossy().to_string();
+    let rsync_spin = output::spinner::spin("restoring dotfiles");
     if system::cmd_exists("rsync") {
         let ts = system::run("date", &["+%Y%m%d-%H%M%S"])?.stdout.trim().to_string();
         let r = system::run(
@@ -378,11 +392,13 @@ fn restore_dotfiles(
             &["-a", &format!("--backup"), &format!("--suffix=.pre-recipe-{ts}"), &stage_s, &home_s],
         )?;
         if r.status != 0 {
+            rsync_spin.fail("dotfiles restore failed");
             return Err(format!("rsync failed: {}", r.stderr.trim()));
         }
     } else {
         copy_stage(&stage, home)?;
     }
+    rsync_spin.succeed(None);
     if let Some(u) = as_user {
         // Everything we placed must belong to the owner, not root.
         let _ = system::run("chown", &["-R", &format!("{u}:{u}"), &home_s]);

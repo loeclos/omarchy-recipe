@@ -98,6 +98,7 @@ pub fn ok(msg: &str) {
 }
 
 pub fn warn(msg: &str) {
+    let _guard = spinner::lock_line();
     eprintln!("{} {}", yellow("!"), msg);
 }
 
@@ -187,4 +188,230 @@ mod tests {
         summary("test", &[("key", "value".to_string()), ("longer-key", num(42))]);
     }
 
+}
+
+/// Animated step spinners.
+///
+/// `spin("compressing dotfiles")` starts a guard: on ttys it animates a
+/// braille frame on one stderr line while the step runs; on pipes/logs it
+/// prints plain start/done lines. Dropping the guard reports `done`
+/// (call `.fail()` first on error paths so a failure never gets a ✓).
+/// Nested `spin()` calls (e.g. export running inside build-iso) degrade to
+/// silent guards so two animations never fight over one line.
+pub mod spinner {
+    use std::cell::Cell;
+    use std::io::{IsTerminal, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    thread_local! {
+        static ACTIVE: Cell<bool> = const { Cell::new(false) };
+    }
+
+    static LINE_LOCK: Mutex<()> = Mutex::new(());
+
+    const FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+    fn animate_enabled() -> bool {
+        if std::env::var_os("NO_COLOR").is_some() {
+            return false;
+        }
+        if std::env::var("TERM").as_deref() == Ok("dumb") {
+            return false;
+        }
+        std::io::stderr().is_terminal()
+    }
+
+    pub(crate) fn lock_line() -> std::sync::MutexGuard<'static, ()> {
+        LINE_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub fn fmt_elapsed(d: Duration) -> String {
+        let s = d.as_secs();
+        if s < 60 {
+            format!("{s}s")
+        } else if s < 3600 {
+            format!("{}m {:02}s", s / 60, s % 60)
+        } else {
+            format!("{}h {:02}m", s / 3600, (s % 3600) / 60)
+        }
+    }
+
+    pub struct Spinner {
+        label: String,
+        detail: Arc<Mutex<String>>,
+        started: Instant,
+        stop: Arc<AtomicBool>,
+        paused: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+        silent: bool,
+        finished: bool,
+    }
+
+    /// Guard that clears the spinner line while a child inherits the
+    /// terminal, then resumes animation on drop.
+    pub struct PauseGuard<'a> {
+        spinner: &'a Spinner,
+    }
+
+    impl Drop for PauseGuard<'_> {
+        fn drop(&mut self) {
+            self.spinner.paused.store(false, Ordering::Relaxed);
+        }
+    }
+
+    pub fn spin(label: &str) -> Spinner {
+        let nested = ACTIVE.get();
+        if !nested {
+            ACTIVE.set(true);
+        }
+        let animated = !nested && animate_enabled();
+        let detail = Arc::new(Mutex::new(label.to_string()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
+        if !animated {
+            if !nested {
+                let _guard = lock_line();
+                eprintln!("… {label}");
+            }
+            return Spinner {
+                label: label.to_string(),
+                detail,
+                started: Instant::now(),
+                stop,
+                paused,
+                handle: None,
+                silent: nested,
+                finished: false,
+            };
+        }
+        let d2 = Arc::clone(&detail);
+        let s2 = Arc::clone(&stop);
+        let p2 = Arc::clone(&paused);
+        let handle = std::thread::spawn(move || {
+            let mut i = 0usize;
+            let start = Instant::now();
+            loop {
+                if s2.load(Ordering::Relaxed) {
+                    break;
+                }
+                if !p2.load(Ordering::Relaxed) {
+                    let text = d2.lock().map(|g| g.clone()).unwrap_or_default();
+                    let _guard = lock_line();
+                    eprint!(
+                        "\r  {} {} ({})   ",
+                        FRAMES[i % FRAMES.len()],
+                        text,
+                        fmt_elapsed(start.elapsed())
+                    );
+                    let _ = std::io::stderr().flush();
+                }
+                std::thread::sleep(Duration::from_millis(80));
+                i += 1;
+            }
+        });
+        Spinner {
+            label: label.to_string(),
+            detail,
+            started: Instant::now(),
+            stop,
+            paused,
+            handle: Some(handle),
+            silent: false,
+            finished: false,
+        }
+    }
+
+    impl Spinner {
+        /// Update the animated detail text (e.g. bake sub-phase).
+        pub fn set_detail(&self, detail: &str) {
+            if let Ok(mut guard) = self.detail.lock() {
+                *guard = detail.to_string();
+            }
+        }
+
+        /// Temporarily clear the animation while a child owns the terminal.
+        pub fn pause(&self) -> PauseGuard<'_> {
+            self.paused.store(true, Ordering::Relaxed);
+            {
+                let _guard = lock_line();
+                eprint!("\r{}", " ".repeat(80));
+                eprint!("\r");
+                let _ = std::io::stderr().flush();
+            }
+            PauseGuard { spinner: self }
+        }
+
+        fn finish(&mut self, ok: bool, msg: &str) {
+            if self.finished {
+                return;
+            }
+            self.finished = true;
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                let _ = handle.join();
+            }
+            ACTIVE.set(false);
+            if self.silent {
+                return;
+            }
+            let elapsed = fmt_elapsed(self.started.elapsed());
+            let _guard = lock_line();
+            if animate_enabled() {
+                eprint!("\r{}", " ".repeat(80));
+                eprint!("\r");
+            }
+            let mark = if ok { "✓" } else { "✗" };
+            eprintln!("  {mark} {} ({elapsed})", msg);
+        }
+
+        /// Step succeeded. Consumes the guard.
+        pub fn succeed(mut self, msg: Option<&str>) {
+            let label = self.label.clone();
+            self.finish(true, msg.unwrap_or(&label));
+        }
+
+        /// Step failed (prints ✗; caller still returns the error).
+        pub fn fail(mut self, msg: &str) {
+            self.finish(false, msg);
+        }
+    }
+
+    impl Drop for Spinner {
+        fn drop(&mut self) {
+            let label = self.label.clone();
+            self.finish(true, &label);
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn spin_lifecycle_no_hang() {
+            let sp = spin("testing");
+            sp.set_detail("still testing");
+            sp.succeed(None);
+        }
+
+        #[test]
+        fn nested_spins_are_silent() {
+            let outer = spin("outer");
+            let inner = spin("inner");
+            assert!(inner.silent);
+            inner.succeed(None);
+            outer.succeed(None);
+        }
+
+        #[test]
+        fn pause_resume_roundtrip() {
+            let sp = spin("pausable");
+            {
+                let _p = sp.pause();
+            }
+            sp.succeed(None);
+        }
+    }
 }

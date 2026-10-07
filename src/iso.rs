@@ -165,17 +165,35 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         }
     }
     let log_path = workdir.join("iso-build.log");
+    let bake_spin = output::spinner::spin("baking ISO");
+
+    // 5a. Docker daemon probe. Informational only: omarchy-iso-make retries
+    // with sudo, which may prompt interactively where our probe cannot.
+    bake_spin.set_detail("checking docker daemon");
+    probe_docker();
+
+    // 5b. Explicit base-image pull so the biggest download shows progress
+    // instead of hiding inside the container run. Best effort: the build
+    // retries (possibly elevated) on its own.
+    bake_spin.set_detail("pulling archlinux/archlinux:latest");
+    pre_pull(&bake_spin, &log_path);
+
+    // 5c. The bake. Output always lands in the log (the watcher below needs
+    // it); verbose mode additionally streams it live.
+    bake_spin.set_detail(&format!("building (log: {})", log_path.display()));
+    let log_file = std::fs::File::create(&log_path)
+        .map_err(|e| format!("cannot create build log: {e}"))?;
     let mut cmd = std::process::Command::new(checkout.join("bin/omarchy-iso-make"));
     cmd.current_dir(&checkout)
         .arg("--keep-pkg-cache")
         .arg("--no-boot-offer")
-        .env("OMARCHY_MIRROR", &opts.mirror);
-    if output::is_quiet() {
-        let log = std::fs::File::create(&log_path)
-            .map_err(|e| format!("cannot create build log: {e}"))?;
-        cmd.stdout(log.try_clone().map_err(|e| format!("log redirect failed: {e}"))?);
-        cmd.stderr(log);
-    }
+        .env("OMARCHY_MIRROR", &opts.mirror)
+        .stdout(
+            log_file
+                .try_clone()
+                .map_err(|e| format!("log redirect failed: {e}"))?,
+        )
+        .stderr(log_file);
     match opts.mirror.as_str() {
         "edge" => {
             cmd.arg("--edge");
@@ -186,21 +204,21 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         _ => {}
     }
     let started = std::time::Instant::now();
-    let status = cmd.status().map_err(|e| format!("cannot run omarchy-iso-make: {e}"))?;
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| format!("cannot run omarchy-iso-make: {e}"))?;
+    let status = pump_log(&log_path, &bake_spin, &mut child)?;
     let elapsed = started.elapsed();
     if !status.success() {
-        if output::is_quiet() {
-            return Err(format!(
-                "omarchy-iso-make failed after {}; see {}",
-                fmt_duration(elapsed),
-                log_path.display()
-            ));
-        }
-        return Err("omarchy-iso-make failed (see above)".into());
+        bake_spin.fail("bake failed");
+        return Err(format!(
+            "omarchy-iso-make failed after {}; see {}",
+            fmt_duration(elapsed),
+            log_path.display()
+        ));
     }
-
+    bake_spin.succeed(Some(&format!("ISO baked in {}", fmt_duration(elapsed))));
     let (iso_name, iso_size) = newest_iso(&checkout);
-    output::ok(&format!("ISO baked in {}", fmt_duration(elapsed)));
     let mut rows = vec![
         ("file", output::path(&iso_name).into()),
         ("size", iso_size.into()),
@@ -265,6 +283,152 @@ fn human_size(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1}{}", UNITS[u])
+    }
+}
+
+/// Docker daemon probe. Informational only — omarchy-iso-make retries with
+/// sudo, which may prompt interactively where this probe cannot.
+fn probe_docker() {
+    if system::run("docker", &["version"]).map(|r| r.status == 0).unwrap_or(false) {
+        output::info("docker daemon reachable");
+        return;
+    }
+    if system::run("sudo", &["-n", "docker", "version"])
+        .map(|r| r.status == 0)
+        .unwrap_or(false)
+    {
+        output::info("docker needs sudo (omarchy-iso-make handles it)");
+        return;
+    }
+    output::warn("docker daemon not reachable as you; the build will try sudo and may prompt");
+}
+
+/// Explicit base-image pull so the biggest download gets its own progress
+/// instead of hiding inside the container run. Best effort.
+fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path) {
+    if output::is_quiet() {
+        let log = match std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+            Ok(f) => f,
+            Err(e) => {
+                output::warn(&format!("cannot open build log: {e}"));
+                return;
+            }
+        };
+        let err_log = match log.try_clone() {
+            Ok(f) => f,
+            Err(e) => {
+                output::warn(&format!("log redirect failed: {e}"));
+                return;
+            }
+        };
+        let r = std::process::Command::new("docker")
+            .args(["pull", "archlinux/archlinux:latest"])
+            .stdout(log)
+            .stderr(err_log)
+            .status();
+        match r {
+            Ok(s) if s.success() => output::info("base image ready"),
+            _ => output::warn("base image pull failed; continuing (the build retries)"),
+        }
+        return;
+    }
+    let _paused = spin.pause();
+    let r = std::process::Command::new("docker")
+        .args(["pull", "archlinux/archlinux:latest"])
+        .status();
+    match r {
+        Ok(s) if s.success() => {}
+        _ => output::warn("base image pull failed; continuing (the build retries)"),
+    }
+}
+
+/// Map a build-log line to spinner detail text.
+fn bake_detail(line: &str) -> Option<&'static str> {
+    if line.contains("Cloning into") {
+        Some("fetching archiso sources")
+    } else if line.contains("full system upgrade") {
+        Some("upgrading build container")
+    } else if line.contains("Synchronizing package databases") {
+        Some("syncing package databases")
+    } else if line.contains("resolving dependencies") {
+        Some("resolving dependencies")
+    } else if line.contains("Target install resolves to") {
+        Some("offline mirror ready")
+    } else if line.contains("Parallel mksquashfs") || line.contains("Creating SquashFS") {
+        Some("building live filesystem (slow)")
+    } else if line.contains("Creating checksum") {
+        Some("writing checksums")
+    } else if line.contains("Creating ISO image") {
+        Some("writing ISO image")
+    } else if line.contains("[mkarchiso] INFO: Done!") {
+        Some("finalizing")
+    } else if line.contains("ERROR") || line.contains("FAILURE") {
+        Some("failed — see build log")
+    } else {
+        None
+    }
+}
+
+/// Pump the build log while the child runs: stream lines live in verbose
+/// mode and advance the spinner detail on recognized markers.
+fn pump_log(
+    log_path: &Path,
+    spin: &output::spinner::Spinner,
+    child: &mut std::process::Child,
+) -> Result<std::process::ExitStatus, String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let verbose = !output::is_quiet();
+    let mut offset: u64 = 0;
+    let mut pending = String::new();
+    loop {
+        if let Ok(mut f) = std::fs::File::open(log_path) {
+            if f.seek(SeekFrom::Start(offset)).is_ok() {
+                let mut buf = vec![0u8; 64 * 1024];
+                loop {
+                    match f.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            offset += n as u64;
+                            pending.push_str(&String::from_utf8_lossy(&buf[..n]));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
+        while let Some(pos) = pending.find('\n') {
+            let line: String = pending.drain(..=pos).collect();
+            let line = line.trim_end();
+            if verbose && !line.trim().is_empty() {
+                println!("{line}");
+            }
+            if let Some(detail) = bake_detail(line) {
+                spin.set_detail(detail);
+            }
+        }
+        match child.try_wait() {
+            Err(e) => return Err(format!("bake child error: {e}")),
+            Ok(Some(status)) => {
+                // Final drain: lines written between last poll and exit.
+                if let Ok(mut f) = std::fs::File::open(log_path) {
+                    if f.seek(SeekFrom::Start(offset)).is_ok() {
+                        let mut rest = String::new();
+                        use std::io::Read as _;
+                        let _ = f.read_to_string(&mut rest);
+                        for line in rest.lines() {
+                            if verbose && !line.trim().is_empty() {
+                                println!("{line}");
+                            }
+                            if let Some(detail) = bake_detail(line) {
+                                spin.set_detail(detail);
+                            }
+                        }
+                    }
+                }
+                return Ok(status);
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(200)),
+        }
     }
 }
 
@@ -360,10 +524,13 @@ fn prepare_checkout(iso_checkout: Option<&str>, workdir: &Path) -> Result<PathBu
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
+    let clone_spin = output::spinner::spin("cloning omarchy-iso");
     let r = system::run("git", &["clone", "--depth", "1", ISO_REPO, &workdir.to_string_lossy()])?;
     if r.status != 0 {
+        clone_spin.fail("clone failed");
         return Err(format!("clone failed: {}", r.stderr.trim()));
     }
+    clone_spin.succeed(None);
     Ok(workdir.to_path_buf())
 }
 
@@ -634,5 +801,42 @@ mod tests {
     fn default_workdir_is_not_tmp() {
         let w = default_workdir().unwrap();
         assert!(!w.starts_with("/tmp"), "workdir must avoid tmpfs: {w:?}");
+    }
+
+    #[test]
+    fn bake_detail_maps_phases() {
+        assert_eq!(
+            bake_detail("Cloning into 'archiso'..."),
+            Some("fetching archiso sources")
+        );
+        assert_eq!(
+            bake_detail("Target install resolves to 912 packages."),
+            Some("offline mirror ready")
+        );
+        assert_eq!(
+            bake_detail("[mkarchiso] INFO: Creating ISO image..."),
+            Some("writing ISO image")
+        );
+        assert_eq!(bake_detail("[mkarchiso] INFO: Done!"), Some("finalizing"));
+        assert_eq!(
+            bake_detail("xorriso : FAILURE : blah"),
+            Some("failed — see build log")
+        );
+        assert_eq!(bake_detail(":: downloading foo.pkg"), None);
+    }
+
+    #[test]
+    fn pump_drains_prefilled_log() {
+        let dir = std::env::temp_dir().join("omr-pump");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("bake.log");
+        std::fs::write(&log, "Cloning into x\nTarget install resolves to 900 packages.\n")
+            .unwrap();
+        let sp = output::spinner::spin("pump");
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let status = pump_log(&log, &sp, &mut child).unwrap();
+        assert!(status.success());
+        sp.succeed(None);
     }
 }
