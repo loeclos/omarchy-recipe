@@ -28,13 +28,13 @@ omarchy-recipe export --out ./airgap.recipe --aur-mode vendored --aur-pkgdir ./p
 # Company cloning (trusted channels only): keep secrets in the bundle
 # (.ssh, .gnupg, .pki, *secret*, *token* — filtered out by default)
 omarchy-recipe export --out ./fleet.recipe --include-secrets
-```
 
 omarchy-recipe validate ./my-machine.recipe   # no arg = use ./
 omarchy-recipe import ./my-machine.recipe --yes
 
 # Bake a custom ISO (needs docker + sudo + network; --dry-run needs none).
 # No bundle = export this machine on the spot and bake that.
+
 omarchy-recipe build-iso --mirror edge
 omarchy-recipe build-iso ./my-machine.recipe --mirror edge --dry-run
 omarchy-recipe build-iso ./airgap.recipe --mirror stable
