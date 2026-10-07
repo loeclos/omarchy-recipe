@@ -84,8 +84,9 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
     output::stage(2, 5, "Preparing omarchy-iso checkout");
     let workdir = match opts.workdir {
         Some(w) => PathBuf::from(w),
-        None => std::env::temp_dir().join(format!("omr-iso-{}", std::process::id())),
+        None => default_workdir()?,
     };
+    check_free_space(&workdir)?;
     let checkout = prepare_checkout(opts.iso_checkout.as_deref(), &workdir)?;
     output::info(&format!("Checkout: {}", output::path(&checkout.display().to_string())));
 
@@ -290,6 +291,54 @@ fn auto_export_bundle(aur_mode: AurMode, aur_pkgdir: Option<&str>) -> Result<Pat
     Ok(dir)
 }
 
+/// Default build root on persistent storage. /tmp is often a small tmpfs that
+/// cannot hold the multi-GB mirror + mkarchiso work tree + final ISO.
+fn default_workdir() -> Result<PathBuf, String> {
+    let base = system::home_dir()
+        .map(|h| h.join(".cache/omarchy-recipe"))
+        .unwrap_or_else(std::env::temp_dir);
+    Ok(base.join(format!("iso-build-{}", std::process::id())))
+}
+
+/// Minimum free bytes on the workdir filesystem: offline mirror + work tree +
+/// final ISO + headroom. Fails fast instead of dying in xorriso hours later.
+const MIN_FREE_BYTES: u64 = 25 * 1024 * 1024 * 1024;
+
+fn check_free_space(workdir: &Path) -> Result<(), String> {
+    // Ensure the path exists enough for df to report its filesystem.
+    let anchor = if workdir.exists() {
+        workdir.to_path_buf()
+    } else if let Some(parent) = workdir.parent() {
+        if parent.exists() {
+            parent.to_path_buf()
+        } else {
+            return Ok(()); // Nowhere to measure; docker will fail loudly instead.
+        }
+    } else {
+        return Ok(());
+    };
+    let r = system::run("df", &["-B1", "--output=avail", &anchor.to_string_lossy()])?;
+    if r.status != 0 {
+        return Ok(());
+    }
+    let avail: Option<u64> = r.stdout.lines().skip(1).find_map(|l| l.trim().parse().ok());
+    match avail {
+        Some(bytes) if space_ok(bytes) => Ok(()),
+        Some(bytes) => Err(format!(
+            "only {} free on {} — ISO builds need {}+ (mirror + work tree + ISO). \
+             Pass --workdir on a bigger filesystem (NOT /tmp: it is usually a small tmpfs).",
+            human_size(bytes),
+            anchor.display(),
+            human_size(MIN_FREE_BYTES)
+        )),
+        None => Ok(()),
+    }
+}
+
+fn space_ok(bytes: u64) -> bool {
+    bytes >= MIN_FREE_BYTES
+}
+
 fn prepare_checkout(iso_checkout: Option<&str>, workdir: &Path) -> Result<PathBuf, String> {    if let Some(dir) = iso_checkout {
         let p = PathBuf::from(dir);
         if !p.join("builder/build-iso.sh").is_file() {
@@ -307,6 +356,10 @@ fn prepare_checkout(iso_checkout: Option<&str>, workdir: &Path) -> Result<PathBu
         return Err("git not found; needed to clone omarchy-iso".into());
     }
     output::info(&format!("Cloning {ISO_REPO} ..."));
+    if let Some(parent) = workdir.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
+    }
     let r = system::run("git", &["clone", "--depth", "1", ISO_REPO, &workdir.to_string_lossy()])?;
     if r.status != 0 {
         return Err(format!("clone failed: {}", r.stderr.trim()));
@@ -554,5 +607,32 @@ mod tests {
             std::fs::read_to_string(&p).unwrap(),
             "installer.sanity_check(foo=1)\n"
         );
+    }
+
+    #[test]
+    fn space_threshold() {
+        // 25 GiB floor: the failed bake needed ~6.5G for the ISO alone,
+        // plus mirror + work tree.
+        assert!(space_ok(25 * 1024 * 1024 * 1024));
+        assert!(space_ok(200 * 1024 * 1024 * 1024));
+        assert!(!space_ok(3_900_000_000)); // ~3.6G tmpfs that killed the bake
+        assert!(!space_ok(0));
+    }
+
+    #[test]
+    fn parse_avail_reads_df_output() {
+        let out = "      Avail\n 27492389888\n";
+        let avail: Option<u64> = out.lines().skip(1).find_map(|l| l.trim().parse().ok());
+        assert_eq!(avail, Some(27492389888));
+        assert!(avail.unwrap() >= MIN_FREE_BYTES);
+        let small = "      Avail\n  3900000000\n";
+        let avail2: Option<u64> = small.lines().skip(1).find_map(|l| l.trim().parse().ok());
+        assert!(avail2.unwrap() < MIN_FREE_BYTES);
+    }
+
+    #[test]
+    fn default_workdir_is_not_tmp() {
+        let w = default_workdir().unwrap();
+        assert!(!w.starts_with("/tmp"), "workdir must avoid tmpfs: {w:?}");
     }
 }
