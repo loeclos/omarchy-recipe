@@ -34,10 +34,11 @@ omarchy-recipe import ./my-machine.recipe --yes
 
 # Bake a custom ISO (needs docker + sudo + network; --dry-run needs none).
 # No bundle = export this machine on the spot and bake that.
+# After a real bake you get a QEMU test-drive prompt (--boot yes/no skips it).
 
 omarchy-recipe build-iso --mirror edge
 omarchy-recipe build-iso ./my-machine.recipe --mirror edge --dry-run
-omarchy-recipe build-iso ./airgap.recipe --mirror stable
+omarchy-recipe build-iso ./airgap.recipe --mirror stable --boot no
 
 # Verbose mode: full detail (default shows animated stage spinners, warnings
 # and the end summary; docker output streams to <workdir>/iso-build.log

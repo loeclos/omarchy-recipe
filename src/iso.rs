@@ -31,6 +31,7 @@ pub struct BuildIsoOptions {
     pub aur_pkgdir: Option<String>,
     pub dry_run: bool,
     pub workdir: Option<String>,
+    pub boot: crate::cli::BootWhen,
 }
 
 pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
@@ -40,8 +41,8 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
             opts.mirror
         ));
     }
-    let bundle = match opts.bundle {
-        Some(b) => resolve_bundle_dir(Some(&b))?,
+    let bundle = match opts.bundle.as_deref() {
+        Some(b) => resolve_bundle_dir(Some(b))?,
         None => {
             output::info("No bundle given: exporting this machine on the spot");
             auto_export_bundle(opts.aur.unwrap_or(AurMode::Wifi), opts.aur_pkgdir.as_deref())?
@@ -225,7 +226,8 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         ));
     }
     bake_spin.succeed(Some(&format!("ISO baked in {}", fmt_duration(elapsed))));
-    let (iso_name, iso_size) = newest_iso(&checkout);
+    let (iso_path, iso_size) = newest_iso(&checkout);
+    let iso_name = iso_path.display().to_string();
     let mut rows = vec![
         ("file", output::path(&iso_name).into()),
         ("size", iso_size.into()),
@@ -245,7 +247,70 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         ));
     }
     output::summary("Your ISO", &rows);
+    maybe_boot(opts.boot, &checkout, &iso_path);
     Ok(())
+}
+
+/// Offer (or auto-run / skip) a QEMU test drive of the baked ISO, using the
+/// official `omarchy-iso-boot` helper from the same checkout.
+fn maybe_boot(boot: crate::cli::BootWhen, checkout: &Path, iso_path: &Path) {
+    use crate::cli::BootWhen;
+    use std::io::IsTerminal as _;
+    let interactive = std::io::stdin().is_terminal();
+    let go = if matches!(boot, BootWhen::Ask) && !interactive {
+        output::info("skipping QEMU boot (non-interactive; pass --boot yes/no)");
+        false
+    } else if matches!(boot, BootWhen::Ask) {
+        prompt_boot()
+    } else {
+        should_boot(boot, interactive, false)
+    };
+    if !go {
+        return;
+    }
+    if !iso_path.is_file() {
+        output::warn("no ISO found in release/; skipping QEMU boot");
+        return;
+    }
+    for tool in ["qemu-system-x86_64"] {
+        if !system::cmd_exists(tool) {
+            output::warn(&format!("'{tool}' not found; cannot boot the ISO in QEMU"));
+            return;
+        }
+    }
+    if !Path::new("/dev/kvm").exists() {
+        output::warn("/dev/kvm missing: QEMU will fall back to (slow) software emulation");
+    }
+    let script = checkout.join("bin/omarchy-iso-boot");
+    output::step(&format!("Booting {} in QEMU ...", iso_path.display()));
+    match std::process::Command::new(&script).arg(iso_path).status() {
+        Ok(s) if s.success() => output::ok("QEMU exited"),
+        Ok(s) => output::warn(&format!("omarchy-iso-boot exited with {s}")),
+        Err(e) => output::warn(&format!("cannot run omarchy-iso-boot: {e}")),
+    }
+}
+
+/// Pure decision helper (prompt I/O lives in `prompt_boot`).
+fn should_boot(mode: crate::cli::BootWhen, interactive: bool, answer_yes: bool) -> bool {
+    use crate::cli::BootWhen;
+    match mode {
+        BootWhen::Yes => true,
+        BootWhen::No => false,
+        BootWhen::Ask => interactive && answer_yes,
+    }
+}
+
+/// Yes/no prompt on a clean terminal line. Default is No.
+fn prompt_boot() -> bool {
+    use std::io::Write;
+    output::spinner::clear_active();
+    print!("Boot this ISO in QEMU now? [y/N] ");
+    let _ = std::io::stdout().flush();
+    let mut ans = String::new();
+    if std::io::stdin().read_line(&mut ans).is_err() {
+        return false;
+    }
+    matches!(ans.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 fn fmt_duration(d: std::time::Duration) -> String {
@@ -254,7 +319,7 @@ fn fmt_duration(d: std::time::Duration) -> String {
 }
 
 /// Newest *.iso under <checkout>/release, with human size.
-fn newest_iso(checkout: &Path) -> (String, String) {
+fn newest_iso(checkout: &Path) -> (PathBuf, String) {
     let release = checkout.join("release");
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     if let Ok(entries) = std::fs::read_dir(&release) {
@@ -272,9 +337,9 @@ fn newest_iso(checkout: &Path) -> (String, String) {
     match best {
         Some((_, p)) => {
             let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            (p.display().to_string(), human_size(size))
+            (p, human_size(size))
         }
-        None => ("<not found in release/>".into(), "—".into()),
+        None => (release.join("<not found>"), "—".into()),
     }
 }
 
@@ -874,5 +939,61 @@ mod tests {
         let status = pump_log(&log, &sp, &mut child).unwrap();
         assert!(status.success());
         sp.succeed(None);
+    }
+
+    #[test]
+    fn boot_decision_matrix() {
+        use crate::cli::BootWhen;
+        assert!(should_boot(BootWhen::Yes, false, false));
+        assert!(should_boot(BootWhen::Yes, true, false));
+        assert!(!should_boot(BootWhen::No, true, true));
+        assert!(!should_boot(BootWhen::No, false, false));
+        assert!(should_boot(BootWhen::Ask, true, true));
+        assert!(!should_boot(BootWhen::Ask, true, false));
+        // Non-interactive ask always declines (no prompt possible).
+        assert!(!should_boot(BootWhen::Ask, false, true));
+    }
+}
+
+#[cfg(test)]
+mod boot_launch_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn boot_invokes_helper_with_iso_path() {
+        let dir = std::env::temp_dir().join("omr-boot-launch");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mockbin = dir.join("mockbin");
+        let bindir = dir.join("checkout/bin");
+        std::fs::create_dir_all(&mockbin).unwrap();
+        std::fs::create_dir_all(&bindir).unwrap();
+        std::fs::write(mockbin.join("qemu-system-x86_64"), "#!/bin/sh\nexit 0\n").unwrap();
+        let sentinel = dir.join("booted.txt");
+        std::fs::write(
+            bindir.join("omarchy-iso-boot"),
+            format!("#!/bin/sh\necho \"$1\" > {}\n", sentinel.display()),
+        )
+        .unwrap();
+        for f in [
+            mockbin.join("qemu-system-x86_64"),
+            bindir.join("omarchy-iso-boot"),
+        ] {
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let iso = dir.join("test.iso");
+        std::fs::write(&iso, b"fake").unwrap();
+
+        // Prepend mocks; restore PATH before asserting so a failure cannot
+        // pollute sibling tests running in other threads.
+        let old_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths: Vec<_> = std::env::split_paths(&old_path).collect();
+        paths.insert(0, mockbin);
+        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        maybe_boot(crate::cli::BootWhen::Yes, &dir.join("checkout"), &iso);
+        std::env::set_var("PATH", &old_path);
+
+        let got = std::fs::read_to_string(&sentinel).unwrap();
+        assert_eq!(got.trim(), iso.display().to_string());
     }
 }

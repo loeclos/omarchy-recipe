@@ -100,6 +100,7 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
             aur_pkgdir,
             dry_run,
             workdir,
+            boot,
         }) => iso::run(iso::BuildIsoOptions {
             bundle,
             iso_checkout,
@@ -108,6 +109,7 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
             aur_pkgdir,
             dry_run,
             workdir,
+            boot,
         }),
     }
 }

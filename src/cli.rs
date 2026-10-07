@@ -39,6 +39,16 @@ impl Section {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BootWhen {
+    /// Ask after the bake (skips automatically when non-interactive)
+    Ask,
+    /// Boot the ISO in QEMU without asking
+    Yes,
+    /// Never boot, no prompt
+    No,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum AurMode {
     /// Install AUR packages on first boot / import with network (yay/paru)
     Wifi,
@@ -158,5 +168,10 @@ pub enum Commands {
         /// Where to stage the prepared omarchy-iso checkout (default: temp dir)
         #[arg(long)]
         workdir: Option<String>,
+
+        /// Boot the baked ISO in QEMU for a test drive: ask (default),
+        /// yes (no prompt), or no (never, no prompt)
+        #[arg(long, value_enum, default_value = "ask")]
+        boot: BootWhen,
     },
 }

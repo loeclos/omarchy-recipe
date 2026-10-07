@@ -128,6 +128,11 @@ Studied against upstream `quattro`; these are load-bearing facts:
 - Real bakes need docker + sudo + network and were historically run by the
   user (agents lack docker access). `--dry-run` exercises everything up to
   docker and is the standard agent-side verification.
+- After a real bake, `--boot ask|yes|no` (default `ask`) offers a QEMU test
+  drive via the checkout's `bin/omarchy-iso-boot`. `ask` auto-declines when
+  stdin isn't a tty. The launch path is covered by a hermetic test (stub
+  boot script + mocked `qemu-system-x86_64` on PATH); the y/N prompt itself
+  is intentionally untested (reads real stdin).
 
 ## 5. TUI / spinner system (`output::spinner`)
 
