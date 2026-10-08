@@ -22,7 +22,10 @@ printf '4.0.0.test\n' >"$WORK/omarchy-a/version"
 # --- mocked commands ---
 cat >"$MOCKBIN/pacman" <<'EOF'
 #!/bin/bash
-if [[ $1 == "-Qeq" ]]; then printf 'base-pkg\nother-pkg\nuser-pkg\n'; exit 0; fi
+# -Qeq lists every explicit install incl. AUR ones; -Qm lists foreign.
+# AUR packages must land in `aur`, never in the repo mirror.
+if [[ $1 == "-Qeq" ]]; then printf 'base-pkg\nother-pkg\nuser-pkg\naur-pkg\n'; exit 0; fi
+if [[ $1 == "-Qm" ]]; then printf 'aur-pkg\n'; exit 0; fi
 echo "mock pacman $*" >&2; exit 0
 EOF
 cat >"$MOCKBIN/yay" <<'EOF'

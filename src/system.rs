@@ -137,8 +137,14 @@ pub fn base_pkg_set(root: &Path) -> HashSet<String> {
 }
 
 /// Explicitly-installed repo packages minus the Omarchy base set.
+///
+/// `pacman -Qeq` lists every explicitly-installed package, including AUR ones
+/// installed via a helper (they're marked explicit). Those belong in `aur`,
+/// not the repo mirror — sending them to the offline mirror produced
+/// "target not found: <pkg>" during the mirror fetch. Drop foreign packages.
 pub fn explicit_repo_pkgs(root: &Path) -> Vec<String> {
     let base = base_pkg_set(root);
+    let foreign = foreign_pkg_set();
     let Ok(r) = run("pacman", &["-Qeq"]) else {
         output::warn("pacman not found; recording empty repo package list");
         return vec![];
@@ -150,11 +156,29 @@ pub fn explicit_repo_pkgs(root: &Path) -> Vec<String> {
         .stdout
         .lines()
         .map(str::trim)
-        .filter(|p| !p.is_empty() && !base.contains(*p))
+        .filter(|p| !p.is_empty() && !base.contains(*p) && !foreign.contains(*p))
         .map(str::to_string)
         .collect();
     out.sort();
     out
+}
+
+/// Packages installed from a foreign source (AUR via a helper).
+fn foreign_pkg_set() -> HashSet<String> {
+    let mut set = HashSet::new();
+    let Ok(r) = run("pacman", &["-Qm"]) else {
+        return set;
+    };
+    if r.status != 0 {
+        return set;
+    }
+    for line in r.stdout.lines() {
+        let name = line.split_whitespace().next().unwrap_or("").trim();
+        if !name.is_empty() {
+            set.insert(name.to_string());
+        }
+    }
+    set
 }
 
 pub fn aur_helper() -> Option<&'static str> {
