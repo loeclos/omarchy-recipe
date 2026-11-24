@@ -158,7 +158,7 @@ pub fn run(opts: ImportOptions) -> Result<(), String> {
             ));
         }
     }
-    output::ok("Import complete.");
+    output::ok("Import complete");
     output::info("Reboot recommended. Old config kept at ~/.config.pre-recipe-*");
     Ok(())
 }

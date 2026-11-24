@@ -80,7 +80,7 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
     }
     if aur_mode == "vendored" && !recipe.excluded("aur") && !recipe.packages.aur.is_empty() {
         if recipe.aur_vendored.is_empty() {
-            output::step("Vendoring AUR packages for the offline ISO ...");
+            output::step("Vendoring AUR packages for the offline ISO");
             recipe.aur_vendored =
                 crate::aur::vendor(&recipe.packages.aur, &bundle, opts.aur_pkgdir.as_deref())?;
             output::info("Prepared vendored AUR manifest for the ISO payload");
@@ -347,7 +347,7 @@ fn maybe_boot(boot: crate::cli::BootWhen, checkout: &Path, iso_path: &Path) {
         output::warn("/dev/kvm missing: QEMU will fall back to (slow) software emulation");
     }
     let script = checkout.join("bin/omarchy-iso-boot");
-    output::step(&format!("Booting {} in QEMU ...", iso_path.display()));
+    output::step(&format!("Booting {} in QEMU", iso_path.display()));
     if let Err(e) = launch_boot(&script, iso_path) {
         output::warn(&format!("cannot run omarchy-iso-boot: {e}"));
     } else {
@@ -998,35 +998,236 @@ fn patch_orchestrator(checkout: &Path) -> Result<(), String> {
 /// Strip the removed `offline` kwarg from the orchestrator's sanity_check call.
 /// The ISO's offline mirror is SigLevel=Never, so no keyring wait was ever
 /// needed; skip_ntp/skip_wkd already cover the remaining waits.
+///
+/// Scoped to `sanity_check(...)` calls only: other `offline=True` uses (e.g.
+/// `arch.make_mirror_handler(offline=True)`) are legitimate and must be left
+/// alone. Upstream already migrated to `arch.sanity_check(installer)` with a
+/// version-conditional adapter; that shape is a no-op here.
 fn compat_sanity_check(impl_path: &Path) -> Result<(), String> {
     const OLD: &str = "        installer.sanity_check(\n            offline=True,\n            skip_ntp=True,\n            skip_wkd=True,\n        )";
     const NEW: &str = "        # omarchy-recipe compat: archinstall >= 4.5 dropped the `offline` kwarg.\n        installer.sanity_check(\n            skip_ntp=True,\n            skip_wkd=True,\n        )";
     let text = std::fs::read_to_string(impl_path)
         .map_err(|e| format!("cannot read {}: {e}", impl_path.display()))?;
-    if text.contains(NEW) {
+    if text.contains(NEW) && find_offending_sanity_check(&text)?.is_none() {
         return Ok(());
     }
-    if !text.contains(OLD) {
-        if text.contains("offline=True") || text.contains("offline = True") {
-            return Err(
-                "archinstall sanity_check still passes offline=True in an unrecognized shape; \
-                 upstream omarchy-iso drifted and the compatibility shim cannot safely patch it"
-                    .into(),
-            );
-        }
-        return Ok(());
-    }
-    let patched = text.replacen(OLD, NEW, 1);
-    if patched.contains("offline=True") || patched.contains("offline = True") {
+    // Fast path for the known 4.4 shape (keeps the compat marker for traceability).
+    let mut patched = if text.contains(OLD) {
+        text.replacen(OLD, NEW, 1)
+    } else {
+        text.clone()
+    };
+    // Generic pass: strip `offline=True` from any remaining sanity_check call,
+    // whatever its formatting (single-line, reordered, extra spaces).
+    patched = strip_offline_from_sanity_checks(patched)?;
+    if find_offending_sanity_check(&patched)?.is_some() {
         return Err(
             "archinstall sanity_check still passes offline=True in an unrecognized shape; \
              upstream omarchy-iso drifted and the compatibility shim cannot safely patch it"
                 .into(),
         );
     }
-    std::fs::write(impl_path, patched)
-        .map_err(|e| format!("cannot write {}: {e}", impl_path.display()))?;
+    if patched != text {
+        std::fs::write(impl_path, patched)
+            .map_err(|e| format!("cannot write {}: {e}", impl_path.display()))?;
+    }
     Ok(())
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+fn is_py_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\r')
+}
+
+/// Locate `offline = True` (any spacing) inside an argument list.
+/// Returns byte offsets relative to `args`, or None.
+fn find_offline_kwarg(args: &str) -> Option<(usize, usize)> {
+    let bytes = args.as_bytes();
+    let mut i = 0;
+    while i + "offline".len() <= bytes.len() {
+        let Some(off) = args[i..].find("offline") else {
+            break;
+        };
+        let s = i + off;
+        let e = s + "offline".len();
+        let before_ok = s == 0 || !is_ident_byte(bytes[s - 1]);
+        let after_ok = e >= bytes.len() || !is_ident_byte(bytes[e]);
+        if before_ok && after_ok {
+            let mut j = e;
+            while j < bytes.len() && is_py_space(bytes[j]) {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                // Skip `==` comparisons; we only match a kwarg assignment.
+                if j + 1 < bytes.len() && bytes[j + 1] == b'=' {
+                    i = e;
+                    continue;
+                }
+                j += 1;
+                while j < bytes.len() && is_py_space(bytes[j]) {
+                    j += 1;
+                }
+                if args[j..].starts_with("True") {
+                    let te = j + "True".len();
+                    if te >= bytes.len() || !is_ident_byte(bytes[te]) {
+                        return Some((s, te));
+                    }
+                }
+            }
+        }
+        i = e;
+    }
+    None
+}
+
+/// Find the first `sanity_check(...)` call that still passes a literal
+/// `offline=True`. Returns (open paren, close paren, kwarg start, kwarg end)
+/// as absolute byte offsets. Skips `def sanity_check` definitions and calls
+/// without the kwarg (e.g. the upstream `arch.sanity_check(installer)`
+/// wrapper or `sanity_check(**options)`).
+fn find_offending_sanity_check(text: &str) -> Result<Option<(usize, usize, usize, usize)>, String> {
+    let bytes = text.as_bytes();
+    let mut search_from = 0;
+    while search_from < text.len() {
+        let Some(rel) = text[search_from..].find("sanity_check") else {
+            break;
+        };
+        let name_start = search_from + rel;
+        let name_end = name_start + "sanity_check".len();
+        // Skip `def sanity_check(` definitions.
+        let line_start = text[..name_start].rfind('\n').map(|p| p + 1).unwrap_or(0);
+        let line_prefix = text[line_start..name_start].trim_end();
+        if line_prefix == "def" || line_prefix.ends_with(" def") {
+            search_from = name_end;
+            continue;
+        }
+        // The call's opening paren (allowing whitespace/newlines).
+        let mut k = name_end;
+        while k < bytes.len() && is_py_space(bytes[k]) {
+            k += 1;
+        }
+        if k >= bytes.len() || bytes[k] != b'(' {
+            search_from = name_end;
+            continue;
+        }
+        let open = k;
+        // Match the closing paren, ignoring parens inside strings/comments.
+        let mut depth = 0usize;
+        let mut in_single = false;
+        let mut in_double = false;
+        let mut j = open;
+        let mut close_opt: Option<usize> = None;
+        while j < bytes.len() {
+            let c = bytes[j];
+            if in_single {
+                if c == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if c == b'\'' {
+                    in_single = false;
+                }
+                j += 1;
+                continue;
+            }
+            if in_double {
+                if c == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    in_double = false;
+                }
+                j += 1;
+                continue;
+            }
+            match c {
+                b'\'' => {
+                    in_single = true;
+                    j += 1;
+                }
+                b'"' => {
+                    in_double = true;
+                    j += 1;
+                }
+                b'#' => {
+                    while j < bytes.len() && bytes[j] != b'\n' {
+                        j += 1;
+                    }
+                }
+                b'(' => {
+                    depth += 1;
+                    j += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_opt = Some(j);
+                        break;
+                    }
+                    j += 1;
+                }
+                _ => {
+                    j += 1;
+                }
+            }
+        }
+        let Some(close) = close_opt else {
+            return Err(
+                "archinstall sanity_check call has unbalanced parentheses; \
+                 upstream omarchy-iso drifted and the compatibility shim cannot safely patch it"
+                    .into(),
+            );
+        };
+        let args = &text[open + 1..close];
+        if let Some((rs, re)) = find_offline_kwarg(args) {
+            return Ok(Some((open, close, open + 1 + rs, open + 1 + re)));
+        }
+        search_from = close + 1;
+    }
+    Ok(None)
+}
+
+/// Remove the `offline=True` kwarg from every `sanity_check(...)` call,
+/// keeping the remaining arguments valid Python.
+fn strip_offline_from_sanity_checks(mut text: String) -> Result<String, String> {
+    loop {
+        let found = find_offending_sanity_check(&text)?;
+        let Some((open, close, ks, ke)) = found else {
+            break;
+        };
+        let bytes = text.as_bytes().to_vec();
+        // Comma after the kwarg (skipping whitespace)?
+        let mut f = ke;
+        while f < close && is_py_space(bytes[f]) {
+            f += 1;
+        }
+        let has_after = f < close && bytes[f] == b',';
+        // Comma before the kwarg (skipping whitespace)?
+        let mut bb = ks;
+        while bb > open + 1 && is_py_space(bytes[bb - 1]) {
+            bb -= 1;
+        }
+        let has_before = bb > open + 1 && bytes[bb - 1] == b',';
+        let (rm_start, rm_end) = if has_before {
+            // `..., offline=True` -> `...` (keeps any trailing comma/space).
+            (bb - 1, ke)
+        } else if has_after {
+            // `offline=True, ...` -> `...` (also eats the separator's whitespace).
+            let mut e = f + 1;
+            while e < close && is_py_space(bytes[e]) {
+                e += 1;
+            }
+            (ks, e)
+        } else {
+            (ks, ke)
+        };
+        text.replace_range(rm_start..rm_end, "");
+    }
+    Ok(text)
 }
 
 #[cfg(test)]
@@ -1256,10 +1457,76 @@ mod tests {
     }
 
     #[test]
-    fn compat_fails_loudly_on_unrecognized_offline_kwarg() {
-        let dir = system::temp_dir("omr-compat-unknown").unwrap();
+    fn compat_strips_single_line_offline_kwarg() {
+        // Drifted single-line shape: strip it instead of failing.
+        let dir = system::temp_dir("omr-compat-single").unwrap();
         let p = dir.join("phases_impl.py");
         std::fs::write(&p, "installer.sanity_check(offline=True, skip_ntp=True)\n").unwrap();
+        compat_sanity_check(&p).unwrap();
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert!(!t.contains("offline"));
+        assert!(t.contains("skip_ntp=True"));
+        // Valid Python, idempotent.
+        let r = system::run(
+            "python3",
+            &[
+                "-c",
+                "import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())",
+                &p.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        assert!(r.status == 0, "stripped call must parse: {}", r.stderr);
+        compat_sanity_check(&p).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), t);
+    }
+
+    #[test]
+    fn compat_ignores_offline_outside_sanity_check() {
+        // The reported false positive: upstream migrated to
+        // arch.sanity_check(installer) while make_mirror_handler keeps its
+        // own legitimate offline=True. The shim must no-op.
+        let dir = system::temp_dir("omr-compat-current").unwrap();
+        let p = dir.join("phases_impl.py");
+        let original = "        ctx.state[\"mirror_handler\"] = arch.make_mirror_handler(offline=True)\n\
+             \x20       with _time_step(\"STEP.sanity_check\"):\n\
+             \x20           arch.sanity_check(installer)\n";
+        std::fs::write(&p, original).unwrap();
+        compat_sanity_check(&p).unwrap();
+        assert_eq!(std::fs::read_to_string(&p).unwrap(), original);
+    }
+
+    #[test]
+    fn compat_strips_reordered_and_spaced_shapes() {
+        let dir = system::temp_dir("omr-compat-shapes").unwrap();
+        let p = dir.join("phases_impl.py");
+        std::fs::write(
+            &p,
+            "installer.sanity_check(\n    skip_ntp=True,\n    offline = True,\n    skip_wkd=True,\n)\n",
+        )
+        .unwrap();
+        compat_sanity_check(&p).unwrap();
+        let t = std::fs::read_to_string(&p).unwrap();
+        assert!(!t.contains("offline"));
+        assert!(t.contains("skip_ntp=True"));
+        assert!(t.contains("skip_wkd=True"));
+        let r = system::run(
+            "python3",
+            &[
+                "-c",
+                "import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())",
+                &p.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        assert!(r.status == 0, "stripped call must parse: {}", r.stderr);
+    }
+
+    #[test]
+    fn compat_fails_loudly_on_unparseable_sanity_check() {
+        let dir = system::temp_dir("omr-compat-unknown").unwrap();
+        let p = dir.join("phases_impl.py");
+        std::fs::write(&p, "installer.sanity_check(offline=True, skip_ntp=True\n").unwrap();
         assert!(compat_sanity_check(&p).is_err());
     }
 

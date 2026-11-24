@@ -138,6 +138,25 @@ pub fn base_pkg_set(root: &Path) -> HashSet<String> {
     set
 }
 
+/// pacman (and the yay/paru wrappers) exit 1 when a filtered `-Q` query
+/// matches nothing — e.g. zero foreign packages on a machine without AUR
+/// packages. That is a valid empty list, not a failure. Real failures
+/// (locked/corrupt db, bad args) print an explanation to stderr.
+fn empty_match_ok(r: &CmdResult) -> bool {
+    r.stdout.trim().is_empty() && r.stderr.trim().is_empty()
+}
+
+fn query_failure(prog: &str, args: &str, r: &CmdResult) -> String {
+    let detail = if !r.stderr.trim().is_empty() {
+        r.stderr.trim().to_string()
+    } else if !r.stdout.trim().is_empty() {
+        r.stdout.trim().to_string()
+    } else {
+        format!("exit {}", r.status)
+    };
+    format!("{prog} {args} failed: {detail}")
+}
+
 /// Explicitly-installed repo packages minus the Omarchy base set.
 ///
 /// `pacman -Qeq` lists every explicitly-installed package, including AUR ones
@@ -150,7 +169,10 @@ pub fn explicit_repo_pkgs(root: &Path) -> Result<Vec<String>, String> {
     let r =
         run("pacman", &["-Qeq"]).map_err(|e| format!("cannot list repository packages: {e}"))?;
     if r.status != 0 {
-        return Err(format!("pacman -Qeq failed: {}", r.stderr.trim()));
+        if empty_match_ok(&r) {
+            return Ok(vec![]);
+        }
+        return Err(query_failure("pacman", "-Qeq", &r));
     }
     let mut out: Vec<String> = r
         .stdout
@@ -168,7 +190,10 @@ fn foreign_pkg_set() -> Result<HashSet<String>, String> {
     let mut set = HashSet::new();
     let r = run("pacman", &["-Qm"]).map_err(|e| format!("cannot list foreign packages: {e}"))?;
     if r.status != 0 {
-        return Err(format!("pacman -Qm failed: {}", r.stderr.trim()));
+        if empty_match_ok(&r) {
+            return Ok(set);
+        }
+        return Err(query_failure("pacman", "-Qm", &r));
     }
     for line in r.stdout.lines() {
         let name = line.split_whitespace().next().unwrap_or("").trim();
@@ -197,7 +222,10 @@ pub fn aur_pkgs() -> Result<Vec<String>, String> {
     let r = run(helper, &["-Qmq"])
         .map_err(|e| format!("cannot list AUR packages with {helper}: {e}"))?;
     if r.status != 0 {
-        return Err(format!("{helper} -Qmq failed: {}", r.stderr.trim()));
+        if empty_match_ok(&r) {
+            return Ok(vec![]);
+        }
+        return Err(query_failure(helper, "-Qmq", &r));
     }
     let mut out: Vec<String> = r
         .stdout
@@ -306,4 +334,39 @@ pub fn primary_user() -> Option<String> {
         }
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn result(status: i32, stdout: &str, stderr: &str) -> CmdResult {
+        CmdResult {
+            status,
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn empty_output_exit_1_is_empty_match_not_failure() {
+        // pacman/yay exit 1 with no output when a filtered -Q query matches
+        // nothing (zero foreign/AUR packages). Must be Ok(empty), not Err.
+        assert!(empty_match_ok(&result(1, "", "")));
+        assert!(empty_match_ok(&result(1, "  \n", "  ")));
+    }
+
+    #[test]
+    fn stderr_output_is_real_failure() {
+        assert!(!empty_match_ok(&result(1, "", "error: failed to synchronize")));
+        assert!(!empty_match_ok(&result(1, "some-pkg 1.0", "")));
+    }
+
+    #[test]
+    fn failure_message_never_ends_bare() {
+        let m = query_failure("pacman", "-Qm", &result(1, "", ""));
+        assert!(m.contains("exit 1"), "got: {m}");
+        let m = query_failure("pacman", "-Qm", &result(1, "", "db locked"));
+        assert!(m.contains("db locked"), "got: {m}");
+    }
 }

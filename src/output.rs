@@ -20,7 +20,7 @@ pub fn is_quiet() -> bool {
     QUIET.load(Ordering::Relaxed)
 }
 
-fn color_enabled() -> bool {
+fn stdout_color() -> bool {
     if std::env::var_os("NO_COLOR").is_some() {
         return false;
     }
@@ -30,15 +30,33 @@ fn color_enabled() -> bool {
     std::io::stdout().is_terminal() || std::env::var_os("OMARCHY_RECIPE_FORCE_COLOR").is_some()
 }
 
+fn stderr_color() -> bool {
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    if std::env::var("TERM").as_deref() == Ok("dumb") {
+        return false;
+    }
+    std::io::stderr().is_terminal() || std::env::var_os("OMARCHY_RECIPE_FORCE_COLOR").is_some()
+}
+
 fn paint(code: &str, msg: &str) -> String {
-    if color_enabled() {
+    if stdout_color() {
         format!("\x1b[{code}m{msg}\x1b[0m")
     } else {
         msg.to_string()
     }
 }
 
-// Palette
+fn paint_err(code: &str, msg: &str) -> String {
+    if stderr_color() {
+        format!("\x1b[{code}m{msg}\x1b[0m")
+    } else {
+        msg.to_string()
+    }
+}
+
+// Palette (stdout: headers, ok, info, summary)
 fn cyan(s: &str) -> String {
     paint("36", s)
 }
@@ -51,12 +69,6 @@ fn green(s: &str) -> String {
 fn bold_green(s: &str) -> String {
     paint("1;32", s)
 }
-fn yellow(s: &str) -> String {
-    paint("33", s)
-}
-fn bold_red(s: &str) -> String {
-    paint("1;31", s)
-}
 fn magenta(s: &str) -> String {
     paint("35", s)
 }
@@ -65,6 +77,25 @@ fn bold(s: &str) -> String {
 }
 fn dim(s: &str) -> String {
     paint("2", s)
+}
+
+// Palette (stderr: spinners, warnings, errors). Same hues/weights as the
+// stdout set, but following the stderr tty so piped stdout never leaks
+// ANSI into files and vice versa.
+fn bold_cyan_err(s: &str) -> String {
+    paint_err("1;36", s)
+}
+fn bold_green_err(s: &str) -> String {
+    paint_err("1;32", s)
+}
+fn bold_yellow_err(s: &str) -> String {
+    paint_err("1;33", s)
+}
+fn bold_red_err(s: &str) -> String {
+    paint_err("1;31", s)
+}
+fn dim_err(s: &str) -> String {
+    paint_err("2", s)
 }
 
 /// Value stylers for embedding color in messages.
@@ -91,11 +122,11 @@ pub fn info(msg: &str) {
     if is_quiet() {
         return;
     }
-    print_line(&format!("{} {}", dim(" ->"), msg));
+    print_line(&format!("{} {}", dim("  ->"), msg));
 }
 
 pub fn ok(msg: &str) {
-    print_line(&format!("{} {}", bold_green("✓"), msg));
+    print_line(&format!("  {} {}", bold_green("✓"), msg));
 }
 
 /// Print one complete stdout line without allowing the animation thread to
@@ -126,13 +157,13 @@ pub fn prompt(msg: &str) -> Result<String, String> {
 pub fn warn(msg: &str) {
     let _guard = spinner::lock_line();
     spinner::clear_active_locked();
-    eprintln!("{} {}", yellow("!"), msg);
+    eprintln!("  {} {}", bold_yellow_err("!"), msg);
 }
 
 pub fn error(msg: &str) {
     let _guard = spinner::lock_line();
     spinner::clear_active_locked();
-    eprintln!("{} {}", bold_red("✗"), msg);
+    eprintln!("  {} {}", bold_red_err("✗"), msg);
 }
 
 /// Fatal error: print + exit code.
@@ -326,7 +357,7 @@ pub mod spinner {
         if !animated {
             if !nested {
                 let _guard = lock_line();
-                eprintln!("… {label}");
+                eprintln!("  {} {label}", super::bold_cyan_err("…"));
             }
             return Spinner {
                 label: label.to_string(),
@@ -360,10 +391,13 @@ pub mod spinner {
                     // cleared the line while this frame was waiting.
                     if !p2.load(Ordering::Relaxed) {
                         eprint!(
-                            "\r  {} {} ({})   ",
-                            FRAMES[i % FRAMES.len()],
+                            "\r  {} {} {}   ",
+                            super::bold_cyan_err(FRAMES[i % FRAMES.len()]),
                             text,
-                            fmt_elapsed(start.elapsed())
+                            super::dim_err(&format!(
+                                "({})",
+                                fmt_elapsed(start.elapsed())
+                            ))
                         );
                         let _ = std::io::stderr().flush();
                     }
@@ -430,7 +464,7 @@ pub mod spinner {
             if stderr_tty() {
                 eprint!("\r\x1b[K");
             }
-            eprintln!("  ✓ {prev}");
+            eprintln!("  {} {prev}", super::bold_green_err("✓"));
         }
 
         #[cfg(test)]
@@ -456,8 +490,12 @@ pub mod spinner {
             if stderr_tty() {
                 eprint!("\r\x1b[K");
             }
-            let mark = if ok { "✓" } else { "✗" };
-            eprintln!("  {mark} {} ({elapsed})", msg);
+            let mark = if ok {
+                super::bold_green_err("✓")
+            } else {
+                super::bold_red_err("✗")
+            };
+            eprintln!("  {mark} {} {}", msg, super::dim_err(&format!("({elapsed})")));
         }
 
         /// Step succeeded. Consumes the guard.

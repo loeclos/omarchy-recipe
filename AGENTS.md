@@ -153,6 +153,12 @@ Studied against upstream `quattro`; these are load-bearing facts:
 - `LINE_LOCK` serializes all stderr line writes. Tests run headless (no
   animation) — keep it that way; verify animation via `script(1)` pty
   captures, never screenshots.
+- Visual convention (keep every check/warning identical): headers
+  (`stage`, `step`) at column 0, all sub-lines (`ok`, spinner start/done,
+  `advance`, `info`, `warn`, `error`) 2-space indented. `✓` is always
+  bold-green, `✗` bold-red, `!` bold-yellow, activity (`…`/frames) bold-cyan,
+  elapsed dim. stdout paint follows the stdout tty, stderr paint the stderr
+  tty — never share one color check across both streams.
 
 ## 6. Testing
 

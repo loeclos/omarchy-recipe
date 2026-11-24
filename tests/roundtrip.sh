@@ -169,9 +169,12 @@ mkdir -p "$HOME"
   || { echo "FAIL: restored SSH key is not private" >&2; exit 1; }
 
 # Package-query failures must abort export instead of silently writing an empty list.
+# Note: pacman/yay exit 1 with NO output when a query simply matches nothing
+# (zero foreign/AUR packages) — that is a valid empty list, not a failure.
+# A real failure prints to stderr, so the mock does too.
 FAILBIN="$WORK/failbin"
 mkdir -p "$FAILBIN"
-printf '#!/bin/bash\nexit 1\n' >"$FAILBIN/pacman"
+printf '#!/bin/bash\necho "error: failed to synchronize all databases" >&2\nexit 1\n' >"$FAILBIN/pacman"
 chmod +x "$FAILBIN/pacman"
 if PATH="$FAILBIN:$PATH" "$BIN" export --out "$WORK/fail.recipe" >/dev/null 2>&1; then
   echo "FAIL: export succeeded after pacman query failure" >&2; exit 1
