@@ -150,7 +150,7 @@ pub enum Commands {
         iso_checkout: Option<String>,
 
         /// ISO channel: stable, rc or edge
-        #[arg(long, default_value = "stable")]
+        #[arg(long, value_parser = ["stable", "rc", "edge"], default_value = "stable")]
         mirror: String,
 
         /// Override bundle's AUR mode
@@ -161,11 +161,24 @@ pub enum Commands {
         #[arg(long)]
         aur_pkgdir: Option<String>,
 
+        /// Skip sections when auto-exporting this machine (no bundle given)
+        #[arg(long, value_delimiter = ',')]
+        without: Vec<Section>,
+
+        /// Extra tarball exclude when auto-exporting (repeatable)
+        #[arg(long = "exclude")]
+        excludes: Vec<String>,
+
+        /// Explicitly allow a bundle containing secrets to be baked into an ISO
+        #[arg(long)]
+        allow_secrets: bool,
+
         /// Generate the custom layer + patches without running docker/mkarchiso
         #[arg(long)]
         dry_run: bool,
 
-        /// Where to stage the prepared omarchy-iso checkout (default: temp dir)
+        /// Where to stage the prepared omarchy-iso checkout
+        /// (default: ~/.cache/omarchy-recipe/iso-build-<pid>)
         #[arg(long)]
         workdir: Option<String>,
 

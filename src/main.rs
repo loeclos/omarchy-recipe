@@ -60,7 +60,10 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
             include_secrets,
         }) => export::run(export::ExportOptions {
             out,
-            without: without.into_iter().map(|s| s.as_str().to_string()).collect::<HashSet<_>>(),
+            without: without
+                .into_iter()
+                .map(|s| s.as_str().to_string())
+                .collect::<HashSet<_>>(),
             extra_excludes: excludes,
             aur_mode,
             aur_pkgdir,
@@ -98,6 +101,9 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
             mirror,
             aur,
             aur_pkgdir,
+            without,
+            excludes,
+            allow_secrets,
             dry_run,
             workdir,
             boot,
@@ -107,6 +113,12 @@ fn dispatch(args: Vec<String>) -> Result<(), String> {
             mirror,
             aur,
             aur_pkgdir,
+            without: without
+                .into_iter()
+                .map(|s| s.as_str().to_string())
+                .collect::<HashSet<_>>(),
+            extra_excludes: excludes,
+            allow_secrets,
             dry_run,
             workdir,
             boot,
@@ -120,10 +132,12 @@ fn print_help() {
     println!();
     println!("Usage: omarchy-recipe <export|import|validate|build-iso> [...]");
     println!();
-    println!("  export [--out DIR] [--without sec,...] [--exclude GLOB] [--aur-mode wifi|vendored]");
+    println!(
+        "  export [--out DIR] [--without sec,...] [--exclude GLOB] [--aur-mode wifi|vendored]"
+    );
     println!("  import [DIR] [--yes] [--skip-packages] [--skip-dotfiles]");
     println!("  validate [DIR]");
-    println!("  build-iso <bundle> [--mirror stable|rc|edge] [--aur wifi|vendored] [--dry-run]");
+    println!("  build-iso [bundle] [--mirror stable|rc|edge] [--aur wifi|vendored] [--dry-run]");
     println!();
     println!("Run 'omarchy-recipe <cmd> --help' for details.");
 }

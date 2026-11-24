@@ -4,8 +4,6 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::output;
-
 #[derive(Debug, Clone)]
 pub struct CmdResult {
     pub status: i32,
@@ -14,8 +12,11 @@ pub struct CmdResult {
 }
 
 pub fn cmd_exists(name: &str) -> bool {
+    // Pass the command name as an argument rather than interpolating it into
+    // shell source. All current callers use fixed names, but this keeps the
+    // helper safe if a recipe-supplied value is ever checked.
     Command::new("sh")
-        .args(["-c", &format!("command -v {name} >/dev/null 2>&1")])
+        .args(["-c", "command -v -- \"$1\" >/dev/null 2>&1", "sh", name])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -112,9 +113,7 @@ pub fn git_remote(dir: &Path) -> Option<String> {
         return None;
     }
     match run_in(dir, "git", &["remote", "get-url", "origin"]) {
-        Ok(r) if r.status == 0 && !r.stdout.trim().is_empty() => {
-            Some(r.stdout.trim().to_string())
-        }
+        Ok(r) if r.status == 0 && !r.stdout.trim().is_empty() => Some(r.stdout.trim().to_string()),
         _ => None,
     }
 }
@@ -122,7 +121,10 @@ pub fn git_remote(dir: &Path) -> Option<String> {
 /// Bare package names from omarchy-base.packages + omarchy-other.packages.
 pub fn base_pkg_set(root: &Path) -> HashSet<String> {
     let mut set = HashSet::new();
-    for f in ["install/omarchy-base.packages", "install/omarchy-other.packages"] {
+    for f in [
+        "install/omarchy-base.packages",
+        "install/omarchy-other.packages",
+    ] {
         let Ok(text) = std::fs::read_to_string(root.join(f)) else {
             continue;
         };
@@ -142,15 +144,13 @@ pub fn base_pkg_set(root: &Path) -> HashSet<String> {
 /// installed via a helper (they're marked explicit). Those belong in `aur`,
 /// not the repo mirror — sending them to the offline mirror produced
 /// "target not found: <pkg>" during the mirror fetch. Drop foreign packages.
-pub fn explicit_repo_pkgs(root: &Path) -> Vec<String> {
+pub fn explicit_repo_pkgs(root: &Path) -> Result<Vec<String>, String> {
     let base = base_pkg_set(root);
-    let foreign = foreign_pkg_set();
-    let Ok(r) = run("pacman", &["-Qeq"]) else {
-        output::warn("pacman not found; recording empty repo package list");
-        return vec![];
-    };
+    let foreign = foreign_pkg_set()?;
+    let r =
+        run("pacman", &["-Qeq"]).map_err(|e| format!("cannot list repository packages: {e}"))?;
     if r.status != 0 {
-        return vec![];
+        return Err(format!("pacman -Qeq failed: {}", r.stderr.trim()));
     }
     let mut out: Vec<String> = r
         .stdout
@@ -160,17 +160,15 @@ pub fn explicit_repo_pkgs(root: &Path) -> Vec<String> {
         .map(str::to_string)
         .collect();
     out.sort();
-    out
+    Ok(out)
 }
 
 /// Packages installed from a foreign source (AUR via a helper).
-fn foreign_pkg_set() -> HashSet<String> {
+fn foreign_pkg_set() -> Result<HashSet<String>, String> {
     let mut set = HashSet::new();
-    let Ok(r) = run("pacman", &["-Qm"]) else {
-        return set;
-    };
+    let r = run("pacman", &["-Qm"]).map_err(|e| format!("cannot list foreign packages: {e}"))?;
     if r.status != 0 {
-        return set;
+        return Err(format!("pacman -Qm failed: {}", r.stderr.trim()));
     }
     for line in r.stdout.lines() {
         let name = line.split_whitespace().next().unwrap_or("").trim();
@@ -178,7 +176,7 @@ fn foreign_pkg_set() -> HashSet<String> {
             set.insert(name.to_string());
         }
     }
-    set
+    Ok(set)
 }
 
 pub fn aur_helper() -> Option<&'static str> {
@@ -192,27 +190,62 @@ pub fn aur_helper() -> Option<&'static str> {
 }
 
 /// Explicit foreign (AUR) packages.
-pub fn aur_pkgs() -> Vec<String> {
-    match aur_helper() {
-        Some(helper) => match run(helper, &["-Qmq"]) {
-            Ok(r) if r.status == 0 => {
-                let mut out: Vec<String> = r
-                    .stdout
-                    .lines()
-                    .map(str::trim)
-                    .filter(|p| !p.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                out.sort();
-                out
+pub fn aur_pkgs() -> Result<Vec<String>, String> {
+    let Some(helper) = aur_helper() else {
+        return Err("no AUR helper (yay/paru) found; cannot record the AUR package list".into());
+    };
+    let r = run(helper, &["-Qmq"])
+        .map_err(|e| format!("cannot list AUR packages with {helper}: {e}"))?;
+    if r.status != 0 {
+        return Err(format!("{helper} -Qmq failed: {}", r.stderr.trim()));
+    }
+    let mut out: Vec<String> = r
+        .stdout
+        .lines()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect();
+    out.sort();
+    Ok(out)
+}
+
+/// Create a unique private temporary directory. PID-only names collide with
+/// stale directories and concurrent runs.
+#[cfg(test)]
+pub fn temp_dir(prefix: &str) -> Result<PathBuf, String> {
+    unique_dir(&std::env::temp_dir(), prefix)
+}
+
+pub fn unique_dir(base: &Path, prefix: &str) -> Result<PathBuf, String> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    std::fs::create_dir_all(base).map_err(|e| format!("cannot create {}: {e}", base.display()))?;
+    for _ in 0..100 {
+        let nonce = NEXT.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("cannot read clock: {e}"))?
+            .as_nanos();
+        let path = base.join(format!("{prefix}-{}-{nanos}-{nonce}", std::process::id()));
+        match std::fs::create_dir(&path) {
+            Ok(()) => {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .map_err(|e| format!("cannot secure {}: {e}", path.display()))?;
+                }
+                return Ok(path);
             }
-            _ => vec![],
-        },
-        None => {
-            output::warn("no AUR helper (yay/paru) found; recording empty AUR list");
-            vec![]
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("cannot create {}: {e}", path.display())),
         }
     }
+    Err(format!(
+        "cannot allocate a unique temporary directory for {prefix}"
+    ))
 }
 
 pub fn utc_now() -> String {
@@ -230,6 +263,30 @@ pub fn hostname() -> String {
     }
 }
 
+pub fn user_home(user: &str) -> Option<PathBuf> {
+    let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    text.lines().find_map(|line| {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 7 && parts[0] == user && !parts[5].is_empty() {
+            Some(PathBuf::from(parts[5]))
+        } else {
+            None
+        }
+    })
+}
+
+pub fn user_uid(user: &str) -> Option<u32> {
+    let text = std::fs::read_to_string("/etc/passwd").ok()?;
+    text.lines().find_map(|line| {
+        let parts: Vec<&str> = line.split(':').collect();
+        if parts.len() >= 3 && parts[0] == user {
+            parts[2].parse::<u32>().ok()
+        } else {
+            None
+        }
+    })
+}
+
 /// First human (UID >= 1000, not nobody) username from /etc/passwd.
 pub fn primary_user() -> Option<String> {
     let text = std::fs::read_to_string("/etc/passwd").ok()?;
@@ -240,7 +297,11 @@ pub fn primary_user() -> Option<String> {
         }
         let (name, uid) = (parts[0], parts[2].parse::<u32>().unwrap_or(0));
         let shell = parts[6];
-        if uid >= 1000 && uid < 60000 && name != "nobody" && !shell.ends_with("nologin") && !shell.ends_with("false") {
+        if (1000..60000).contains(&uid)
+            && name != "nobody"
+            && !shell.ends_with("nologin")
+            && !shell.ends_with("false")
+        {
             return Some(name.to_string());
         }
     }

@@ -29,6 +29,9 @@ pub struct BuildIsoOptions {
     pub mirror: String,
     pub aur: Option<AurMode>,
     pub aur_pkgdir: Option<String>,
+    pub without: std::collections::HashSet<String>,
+    pub extra_excludes: Vec<String>,
+    pub allow_secrets: bool,
     pub dry_run: bool,
     pub workdir: Option<String>,
     pub boot: crate::cli::BootWhen,
@@ -45,12 +48,23 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         Some(b) => resolve_bundle_dir(Some(b))?,
         None => {
             output::info("No bundle given: exporting this machine on the spot");
-            auto_export_bundle(opts.aur.unwrap_or(AurMode::Wifi), opts.aur_pkgdir.as_deref())?
+            auto_export_bundle(
+                opts.aur.unwrap_or(AurMode::Wifi),
+                opts.aur_pkgdir.as_deref(),
+                opts.without,
+                opts.extra_excludes,
+            )?
         }
     };
     output::stage(1, 5, "Validating bundle");
-    let mut recipe = Recipe::load(&bundle.join("recipe.json"))?;
-    crate::validate::validate_bundle(&bundle)?;
+    let mut recipe = crate::validate::validate_bundle(&bundle)?;
+    if recipe.selection.include_secrets && !opts.allow_secrets {
+        return Err(
+            "this bundle contains secrets; refusing to bake it into an ISO. \
+             Re-export without --include-secrets, or pass --allow-secrets only for a trusted private ISO."
+                .into(),
+        );
+    }
 
     // Resolve AUR mode: CLI override wins over the bundle.
     let aur_mode: String = match opts.aur {
@@ -58,18 +72,18 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         Some(AurMode::Wifi) => "wifi".into(),
         None => recipe.packages.aur_mode.clone(),
     };
+    recipe.packages.aur_mode = aur_mode.clone();
+    if aur_mode == "wifi" {
+        // A CLI override must not leave a vendored manifest in the payload
+        // without shipping the corresponding package files.
+        recipe.aur_vendored.clear();
+    }
     if aur_mode == "vendored" && !recipe.excluded("aur") && !recipe.packages.aur.is_empty() {
         if recipe.aur_vendored.is_empty() {
             output::step("Vendoring AUR packages for the offline ISO ...");
-            let vendored =
+            recipe.aur_vendored =
                 crate::aur::vendor(&recipe.packages.aur, &bundle, opts.aur_pkgdir.as_deref())?;
-            recipe.packages.aur_mode = "vendored".into();
-            recipe.aur_vendored = vendored;
-            let json = serde_json::to_string_pretty(&recipe).map_err(|e| format!("JSON: {e}"))?;
-            std::fs::write(bundle.join("recipe.json"), json + "\n")
-                .map_err(|e| format!("cannot update bundle recipe.json: {e}"))?;
-            // Tarball unchanged, but its recorded sha must still match: recompute not needed.
-            output::info("Bundle recipe.json updated with vendored AUR manifest");
+            output::info("Prepared vendored AUR manifest for the ISO payload");
         } else {
             output::info("Bundle already carries vendored AUR packages");
         }
@@ -87,25 +101,54 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         Some(w) => PathBuf::from(w),
         None => default_workdir()?,
     };
-    check_free_space(&workdir)?;
+    let workdir = absolute_path(workdir)?;
+    if !opts.dry_run {
+        check_free_space(&workdir)?;
+    }
     let checkout = prepare_checkout(opts.iso_checkout.as_deref(), &workdir)?;
-    output::info(&format!("Checkout: {}", output::path(&checkout.display().to_string())));
+    // With --iso-checkout the checkout lives elsewhere, but --workdir is still
+    // the log directory and may not exist yet.
+    if !workdir.exists() {
+        std::fs::create_dir_all(&workdir)
+            .map_err(|e| format!("cannot create {}: {e}", workdir.display()))?;
+    }
+    let checkout_ref = system::run_in(&checkout, "git", &["rev-parse", "HEAD"])
+        .ok()
+        .filter(|r| r.status == 0)
+        .map(|r| r.stdout.trim().to_string())
+        .filter(|s| !s.is_empty());
+    output::info(&format!(
+        "Checkout: {}",
+        output::path(&checkout.display().to_string())
+    ));
 
     // --- payload ---
     output::stage(3, 5, "Staging recipe payload");
     let payload = checkout.join("configs/airootfs/usr/share/omarchy-iso/recipe");
-    std::fs::create_dir_all(&payload)
-        .map_err(|e| format!("cannot create payload dir: {e}"))?;
-    std::fs::copy(bundle.join("recipe.json"), payload.join("recipe.json"))
+    if payload.exists() {
+        std::fs::remove_dir_all(&payload)
+            .map_err(|e| format!("cannot clear stale payload dir: {e}"))?;
+    }
+    std::fs::create_dir_all(&payload).map_err(|e| format!("cannot create payload dir: {e}"))?;
+    let tarball = tarball_path(&bundle, &recipe)?;
+    // The live payload always uses one canonical filename, regardless of the
+    // compression format selected by the exporter.
+    recipe.dotfiles.file = "dotfiles.tar.zst".into();
+    let recipe_json = serde_json::to_string_pretty(&recipe)
+        .map_err(|e| format!("cannot serialize prepared recipe: {e}"))?;
+    std::fs::write(payload.join("recipe.json"), recipe_json + "\n")
         .map_err(|e| format!("cannot stage recipe.json: {e}"))?;
-    let tarball = tarball_path(&bundle, &recipe);
     std::fs::copy(&tarball, payload.join("dotfiles.tar.zst"))
         .map_err(|e| format!("cannot stage dotfiles: {e}"))?;
-    if aur_mode == "vendored" {
+    if aur_mode == "vendored" && !recipe.aur_vendored.is_empty() {
         let src_aur = bundle.join("aur-pkgs");
-        if src_aur.is_dir() {
-            copy_dir(&src_aur, &payload.join("aur-pkgs"))?;
+        if !src_aur.is_dir() {
+            return Err(format!(
+                "aur_mode=vendored but no vendored package directory at {}",
+                src_aur.display()
+            ));
         }
+        copy_dir(&src_aur, &payload.join("aur-pkgs"))?;
     }
     let exe = std::env::current_exe().map_err(|e| format!("cannot locate own binary: {e}"))?;
     std::fs::copy(&exe, payload.join("omarchy-recipe"))
@@ -114,18 +157,14 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         .map_err(|e| format!("cannot stage unit: {e}"))?;
 
     // --- repo package list for the mirror ---
-    let mut extra = String::from("# Generated by omarchy-recipe build-iso. Do not edit.\n");
-    for p in &repo_pkgs {
-        extra.push_str(p);
-        extra.push('\n');
-    }
-    std::fs::write(checkout.join("configs/recipe-packages.extra"), &extra)
+    let extra = recipe_packages_extra(&repo_pkgs)?;
+    let extra_path = checkout.join("configs/recipe-packages.extra");
+    std::fs::write(&extra_path, &extra)
         .map_err(|e| format!("cannot write recipe-packages.extra: {e}"))?;
 
     // --- patches ---
     output::stage(4, 5, "Applying custom-layer patches");
-    patch_build_script(&checkout)?;
-    patch_orchestrator(&checkout)?;
+    apply_iso_patches(&checkout)?;
 
     output::ok(&format!(
         "Custom layer ready ({} repo pkgs, AUR mode: {aur_mode})",
@@ -138,10 +177,14 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
             "Planned ISO",
             &[
                 ("bundle", output::path(&bundle.display().to_string())),
-                ("channel", opts.mirror.clone().into()),
-                ("repo pkgs", output::num(repo_pkgs.len()).into()),
-                ("aur", aur_mode.clone().into()),
+                ("channel", opts.mirror.clone()),
+                ("repo pkgs", output::num(repo_pkgs.len())),
+                ("aur", aur_mode.clone()),
                 ("checkout", output::path(&checkout.display().to_string())),
+                (
+                    "checkout ref",
+                    checkout_ref.clone().unwrap_or_else(|| "unknown".into()),
+                ),
             ],
         );
         let flag_hint = match opts.mirror.as_str() {
@@ -166,6 +209,7 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
         }
     }
     let log_path = workdir.join("iso-build.log");
+    let pull_log_path = workdir.join("docker-pull.log");
 
     // 5a. Docker daemon probe. Informational only: omarchy-iso-make retries
     // with sudo, which may prompt interactively where our probe cannot.
@@ -181,41 +225,59 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
     // 5c. Explicit base-image pull so the biggest download shows progress
     // instead of hiding inside the container run. Best effort: the build
     // retries (possibly elevated) on its own.
-    bake_spin.set_detail("pulling archlinux/archlinux:latest");
-    if !pre_pull(&bake_spin, &log_path) {
+    let base_image = docker_base_image(&checkout);
+    bake_spin.set_detail(&format!("pulling {base_image}"));
+    if !pre_pull(&bake_spin, &pull_log_path, &base_image) {
         bake_spin.set_detail("base pull deferred — retrying inside build");
     }
 
     // 5d. The bake. Output always lands in the log (the watcher below needs
     // it); verbose mode additionally streams it live.
     bake_spin.advance(&format!("building (log: {})", log_path.display()));
-    let log_file = std::fs::File::create(&log_path)
-        .map_err(|e| format!("cannot create build log: {e}"))?;
-    let mut cmd = std::process::Command::new(checkout.join("bin/omarchy-iso-make"));
-    cmd.current_dir(&checkout)
-        .arg("--keep-pkg-cache")
-        .arg("--no-boot-offer")
-        .env("OMARCHY_MIRROR", &opts.mirror)
-        .stdout(
-            log_file
-                .try_clone()
-                .map_err(|e| format!("log redirect failed: {e}"))?,
-        )
-        .stderr(log_file);
-    match opts.mirror.as_str() {
-        "edge" => {
-            cmd.arg("--edge");
+    let build_started = std::time::SystemTime::now();
+    let prepared = (|| -> Result<std::process::Child, String> {
+        let log_file = std::fs::File::create(&log_path)
+            .map_err(|e| format!("cannot create build log: {e}"))?;
+        let mut cmd = std::process::Command::new(checkout.join("bin/omarchy-iso-make"));
+        cmd.current_dir(&checkout)
+            .arg("--keep-pkg-cache")
+            .arg("--no-boot-offer")
+            .env("OMARCHY_MIRROR", &opts.mirror)
+            .stdout(
+                log_file
+                    .try_clone()
+                    .map_err(|e| format!("log redirect failed: {e}"))?,
+            )
+            .stderr(log_file);
+        match opts.mirror.as_str() {
+            "edge" => {
+                cmd.arg("--edge");
+            }
+            "rc" => {
+                cmd.arg("--rc");
+            }
+            _ => {}
         }
-        "rc" => {
-            cmd.arg("--rc");
+        cmd.spawn()
+            .map_err(|e| format!("cannot run omarchy-iso-make: {e}"))
+    })();
+    let mut child = match prepared {
+        Ok(child) => child,
+        Err(e) => {
+            bake_spin.fail("cannot start ISO bake");
+            return Err(e);
         }
-        _ => {}
-    }
+    };
     let started = std::time::Instant::now();
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("cannot run omarchy-iso-make: {e}"))?;
-    let status = pump_log(&log_path, &bake_spin, &mut child)?;
+    let status = match pump_log(&log_path, &bake_spin, &mut child) {
+        Ok(status) => status,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            bake_spin.fail("ISO build monitoring failed");
+            return Err(e);
+        }
+    };
     let elapsed = started.elapsed();
     if !status.success() {
         bake_spin.fail("bake failed");
@@ -225,26 +287,30 @@ pub fn run(opts: BuildIsoOptions) -> Result<(), String> {
             log_path.display()
         ));
     }
+    let (iso_path, iso_size) = match newest_iso(&checkout, build_started) {
+        Ok(result) => result,
+        Err(e) => {
+            bake_spin.fail("ISO output missing");
+            return Err(e);
+        }
+    };
     bake_spin.succeed(Some(&format!("ISO baked in {}", fmt_duration(elapsed))));
-    let (iso_path, iso_size) = newest_iso(&checkout);
     let iso_name = iso_path.display().to_string();
     let mut rows = vec![
-        ("file", output::path(&iso_name).into()),
-        ("size", iso_size.into()),
-        ("channel", opts.mirror.clone().into()),
-        ("recipe pkgs", output::num(repo_pkgs.len()).into()),
-        ("aur", format!("{aur_mode} (first boot)").into()),
+        ("file", output::path(&iso_name)),
+        ("size", iso_size),
+        ("channel", opts.mirror.clone()),
+        ("recipe pkgs", output::num(repo_pkgs.len())),
+        ("aur", format!("{aur_mode} (first boot)")),
+        ("bundle", output::path(&bundle.display().to_string())),
         (
-            "bundle",
-            output::path(&bundle.display().to_string()).into(),
+            "checkout ref",
+            checkout_ref.unwrap_or_else(|| "unknown".into()),
         ),
-        ("build time", fmt_duration(elapsed).into()),
+        ("build time", fmt_duration(elapsed)),
     ];
     if output::is_quiet() {
-        rows.push((
-            "build log",
-            output::path(&log_path.display().to_string()).into(),
-        ));
+        rows.push(("build log", output::path(&log_path.display().to_string())));
     }
     output::summary("Your ISO", &rows);
     maybe_boot(opts.boot, &checkout, &iso_path);
@@ -272,21 +338,32 @@ fn maybe_boot(boot: crate::cli::BootWhen, checkout: &Path, iso_path: &Path) {
         output::warn("no ISO found in release/; skipping QEMU boot");
         return;
     }
-    for tool in ["qemu-system-x86_64"] {
-        if !system::cmd_exists(tool) {
-            output::warn(&format!("'{tool}' not found; cannot boot the ISO in QEMU"));
-            return;
-        }
+    let tool = "qemu-system-x86_64";
+    if !system::cmd_exists(tool) {
+        output::warn(&format!("'{tool}' not found; cannot boot the ISO in QEMU"));
+        return;
     }
     if !Path::new("/dev/kvm").exists() {
         output::warn("/dev/kvm missing: QEMU will fall back to (slow) software emulation");
     }
     let script = checkout.join("bin/omarchy-iso-boot");
     output::step(&format!("Booting {} in QEMU ...", iso_path.display()));
-    match std::process::Command::new(&script).arg(iso_path).status() {
-        Ok(s) if s.success() => output::ok("QEMU exited"),
-        Ok(s) => output::warn(&format!("omarchy-iso-boot exited with {s}")),
-        Err(e) => output::warn(&format!("cannot run omarchy-iso-boot: {e}")),
+    if let Err(e) = launch_boot(&script, iso_path) {
+        output::warn(&format!("cannot run omarchy-iso-boot: {e}"));
+    } else {
+        output::ok("QEMU exited");
+    }
+}
+
+fn launch_boot(script: &Path, iso_path: &Path) -> Result<(), String> {
+    let status = std::process::Command::new(script)
+        .arg(iso_path)
+        .status()
+        .map_err(|e| e.to_string())?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("omarchy-iso-boot exited with {status}"))
     }
 }
 
@@ -302,15 +379,10 @@ fn should_boot(mode: crate::cli::BootWhen, interactive: bool, answer_yes: bool) 
 
 /// Yes/no prompt on a clean terminal line. Default is No.
 fn prompt_boot() -> bool {
-    use std::io::Write;
-    output::spinner::clear_active();
-    print!("Boot this ISO in QEMU now? [y/N] ");
-    let _ = std::io::stdout().flush();
-    let mut ans = String::new();
-    if std::io::stdin().read_line(&mut ans).is_err() {
-        return false;
+    match output::prompt("Boot this ISO in QEMU now? [y/N] ") {
+        Ok(ans) => matches!(ans.trim().to_lowercase().as_str(), "y" | "yes"),
+        Err(_) => false,
     }
-    matches!(ans.trim().to_lowercase().as_str(), "y" | "yes")
 }
 
 fn fmt_duration(d: std::time::Duration) -> String {
@@ -319,7 +391,10 @@ fn fmt_duration(d: std::time::Duration) -> String {
 }
 
 /// Newest *.iso under <checkout>/release, with human size.
-fn newest_iso(checkout: &Path) -> (PathBuf, String) {
+fn newest_iso(
+    checkout: &Path,
+    build_started: std::time::SystemTime,
+) -> Result<(PathBuf, String), String> {
     let release = checkout.join("release");
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     if let Ok(entries) = std::fs::read_dir(&release) {
@@ -329,17 +404,21 @@ fn newest_iso(checkout: &Path) -> (PathBuf, String) {
                 let m = e.metadata().and_then(|m| m.modified()).ok();
                 match (m, &best) {
                     (Some(t), Some((bt, _))) if t <= *bt => {}
+                    (None, Some(_)) => {}
                     _ => best = Some((m.unwrap_or(std::time::UNIX_EPOCH), p)),
                 }
             }
         }
     }
     match best {
-        Some((_, p)) => {
+        Some((modified, p)) if modified >= build_started => {
             let size = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
-            (p, human_size(size))
+            Ok((p, human_size(size)))
         }
-        None => (release.join("<not found>"), "—".into()),
+        _ => Err(format!(
+            "omarchy-iso-make exited successfully but produced no new ISO in {}",
+            release.display()
+        )),
     }
 }
 
@@ -361,7 +440,10 @@ fn human_size(n: u64) -> String {
 /// Docker daemon probe. Informational only — omarchy-iso-make retries with
 /// sudo, which may prompt interactively where this probe cannot.
 fn probe_docker() {
-    if system::run("docker", &["version"]).map(|r| r.status == 0).unwrap_or(false) {
+    if system::run("docker", &["version"])
+        .map(|r| r.status == 0)
+        .unwrap_or(false)
+    {
         output::info("docker daemon reachable");
         return;
     }
@@ -378,9 +460,54 @@ fn probe_docker() {
 /// Explicit base-image pull so the biggest download gets its own progress
 /// instead of hiding inside the container run. Best effort: returns false
 /// when the pull failed (the build retries, possibly elevated).
-fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path) -> bool {
+fn docker_base_image(checkout: &Path) -> String {
+    const DEFAULT: &str = "archlinux/archlinux:latest";
+    // Upstream pins the actual image in its build wrapper; prefer that over a
+    // Dockerfile default so the progress pull matches the real bake.
+    if let Ok(text) = std::fs::read_to_string(checkout.join("bin/omarchy-iso-make")) {
+        for line in text.lines() {
+            let line = line.trim();
+            let value = line
+                .strip_prefix("CONTAINER_IMAGE=")
+                .or_else(|| line.strip_prefix("readonly CONTAINER_IMAGE="))
+                .or_else(|| line.strip_prefix("export CONTAINER_IMAGE="));
+            if let Some(value) = value {
+                let image = value.trim().trim_matches(['"', '\'']);
+                if !image.is_empty() && !image.contains('$') {
+                    return image.to_string();
+                }
+            }
+        }
+    }
+    for rel in [
+        "Dockerfile",
+        "builder/Dockerfile",
+        "builder/docker/Dockerfile",
+    ] {
+        let Ok(text) = std::fs::read_to_string(checkout.join(rel)) else {
+            continue;
+        };
+        for line in text.lines() {
+            let Some(rest) = line.trim().strip_prefix("FROM ") else {
+                continue;
+            };
+            let image = rest.split_whitespace().next().unwrap_or("");
+            if !image.is_empty() && !image.contains('$') {
+                return image.to_string();
+            }
+        }
+    }
+    DEFAULT.to_string()
+}
+
+fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path, image: &str) -> bool {
     if output::is_quiet() {
-        let log = match std::fs::OpenOptions::new().create(true).append(true).open(log_path) {
+        let log = match std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(log_path)
+        {
             Ok(f) => f,
             Err(e) => {
                 output::warn(&format!("cannot open build log: {e}"));
@@ -395,7 +522,7 @@ fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path) -> bool {
             }
         };
         let r = std::process::Command::new("docker")
-            .args(["pull", "archlinux/archlinux:latest"])
+            .args(["pull", image])
             .stdout(log)
             .stderr(err_log)
             .status();
@@ -412,7 +539,7 @@ fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path) -> bool {
     } else {
         let _paused = spin.pause();
         let r = std::process::Command::new("docker")
-            .args(["pull", "archlinux/archlinux:latest"])
+            .args(["pull", image])
             .status();
         match r {
             Ok(s) if s.success() => true,
@@ -428,7 +555,10 @@ fn pre_pull(spin: &output::spinner::Spinner, log_path: &Path) -> bool {
 /// redirection is active. Otherwise the `sudo docker` fallback would print
 /// its password prompt into the build log (invisible) or mid-animation.
 fn ensure_docker_elevation() {
-    if system::run("docker", &["version"]).map(|r| r.status == 0).unwrap_or(false) {
+    if system::run("docker", &["version"])
+        .map(|r| r.status == 0)
+        .unwrap_or(false)
+    {
         return;
     }
     output::info("docker needs elevation — one password prompt, then the bake runs unattended");
@@ -475,13 +605,23 @@ fn pump_log(
     spin: &output::spinner::Spinner,
     child: &mut std::process::Child,
 ) -> Result<std::process::ExitStatus, String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Read, Seek};
+
     let verbose = !output::is_quiet();
     let mut offset: u64 = 0;
     let mut pending = String::new();
+    let emit = |line: &str| {
+        if verbose && !line.trim().is_empty() {
+            output::print_line(line);
+        }
+        if let Some(detail) = bake_detail(line) {
+            spin.advance(detail);
+        }
+    };
+
     loop {
         if let Ok(mut f) = std::fs::File::open(log_path) {
-            if f.seek(SeekFrom::Start(offset)).is_ok() {
+            if f.seek(std::io::SeekFrom::Start(offset)).is_ok() {
                 let mut buf = vec![0u8; 64 * 1024];
                 loop {
                     match f.read(&mut buf) {
@@ -495,36 +635,26 @@ fn pump_log(
                 }
             }
         }
-        while let Some(pos) = pending.find('\n') {
-            let line: String = pending.drain(..=pos).collect();
-            let line = line.trim_end();
-            if verbose && !line.trim().is_empty() {
-                output::spinner::clear_active();
-                println!("{line}");
-            }
-            if let Some(detail) = bake_detail(line) {
-                spin.advance(detail);
-            }
-        }
+        drain_log_lines(&mut pending, &emit);
         match child.try_wait() {
             Err(e) => return Err(format!("bake child error: {e}")),
             Ok(Some(status)) => {
                 // Final drain: lines written between last poll and exit.
                 if let Ok(mut f) = std::fs::File::open(log_path) {
-                    if f.seek(SeekFrom::Start(offset)).is_ok() {
-                        let mut rest = String::new();
-                        use std::io::Read as _;
-                        let _ = f.read_to_string(&mut rest);
-                        for line in rest.lines() {
-                            if verbose && !line.trim().is_empty() {
-                                output::spinner::clear_active();
-                                println!("{line}");
-                            }
-                            if let Some(detail) = bake_detail(line) {
-                                spin.advance(detail);
+                    if f.seek(std::io::SeekFrom::Start(offset)).is_ok() {
+                        let mut buf = vec![0u8; 64 * 1024];
+                        loop {
+                            match f.read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(n) => pending.push_str(&String::from_utf8_lossy(&buf[..n])),
+                                Err(_) => break,
                             }
                         }
                     }
+                }
+                drain_log_lines(&mut pending, &emit);
+                if !pending.trim().is_empty() {
+                    emit(pending.trim_end());
                 }
                 return Ok(status);
             }
@@ -533,18 +663,42 @@ fn pump_log(
     }
 }
 
+/// Docker and mkarchiso progress often uses carriage returns rather than
+/// newlines. Treat both as line boundaries and cap partial lines so a chatty
+/// child cannot grow this buffer without bound.
+fn drain_log_lines(pending: &mut String, mut emit: impl FnMut(&str)) {
+    loop {
+        let pos = pending.find(['\n', '\r']);
+        match pos {
+            Some(pos) => {
+                let line: String = pending.drain(..=pos).collect();
+                emit(line.trim_end());
+            }
+            None if pending.len() > 1024 * 1024 => {
+                let line = std::mem::take(pending);
+                emit(line.trim_end());
+            }
+            None => return,
+        }
+    }
+}
+
 /// Snapshot the current machine into a fresh temp bundle (no-bundle mode).
 /// Honors the build's AUR mode; secrets are never auto-included.
-fn auto_export_bundle(aur_mode: AurMode, aur_pkgdir: Option<&str>) -> Result<PathBuf, String> {
-    let dir = std::env::temp_dir().join(format!("omr-auto-bundle-{}", std::process::id()));
-    if dir.exists() {
-        std::fs::remove_dir_all(&dir)
-            .map_err(|e| format!("cannot clear {}: {e}", dir.display()))?;
-    }
+fn auto_export_bundle(
+    aur_mode: AurMode,
+    aur_pkgdir: Option<&str>,
+    without: std::collections::HashSet<String>,
+    extra_excludes: Vec<String>,
+) -> Result<PathBuf, String> {
+    let base = system::home_dir()
+        .map(|home| home.join(".cache/omarchy-recipe/auto-bundles"))
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = system::unique_dir(&base, "omr-auto-bundle")?;
     crate::export::run(crate::export::ExportOptions {
         out: Some(dir.to_string_lossy().to_string()),
-        without: std::collections::HashSet::new(),
-        extra_excludes: vec![],
+        without,
+        extra_excludes,
         aur_mode,
         aur_pkgdir: aur_pkgdir.map(|s| s.to_string()),
         include_secrets: false,
@@ -554,6 +708,16 @@ fn auto_export_bundle(aur_mode: AurMode, aur_pkgdir: Option<&str>) -> Result<Pat
         output::path(&dir.display().to_string())
     ));
     Ok(dir)
+}
+
+fn absolute_path(path: PathBuf) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(path)
+    } else {
+        std::env::current_dir()
+            .map(|cwd| cwd.join(path))
+            .map_err(|e| format!("cannot get current directory: {e}"))
+    }
 }
 
 /// Default build root on persistent storage. /tmp is often a small tmpfs that
@@ -570,21 +734,22 @@ fn default_workdir() -> Result<PathBuf, String> {
 const MIN_FREE_BYTES: u64 = 25 * 1024 * 1024 * 1024;
 
 fn check_free_space(workdir: &Path) -> Result<(), String> {
-    // Ensure the path exists enough for df to report its filesystem.
-    let anchor = if workdir.exists() {
-        workdir.to_path_buf()
-    } else if let Some(parent) = workdir.parent() {
-        if parent.exists() {
-            parent.to_path_buf()
-        } else {
-            return Ok(()); // Nowhere to measure; docker will fail loudly instead.
-        }
-    } else {
-        return Ok(());
-    };
-    let r = system::run("df", &["-B1", "--output=avail", &anchor.to_string_lossy()])?;
+    // Measure the nearest existing ancestor; prepare_checkout creates the
+    // requested directory later. Never silently skip the guard.
+    let anchor = workdir
+        .ancestors()
+        .find(|path| path.is_dir())
+        .ok_or_else(|| format!("cannot measure free space for {}", workdir.display()))?;
+    let r = system::run(
+        "df",
+        &["-B1", "--output=avail", "--", &anchor.to_string_lossy()],
+    )?;
     if r.status != 0 {
-        return Ok(());
+        return Err(format!(
+            "df failed for {}: {}",
+            anchor.display(),
+            r.stderr.trim()
+        ));
     }
     let avail: Option<u64> = r.stdout.lines().skip(1).find_map(|l| l.trim().parse().ok());
     match avail {
@@ -596,7 +761,10 @@ fn check_free_space(workdir: &Path) -> Result<(), String> {
             anchor.display(),
             human_size(MIN_FREE_BYTES)
         )),
-        None => Ok(()),
+        None => Err(format!(
+            "cannot parse free space from df for {}",
+            anchor.display()
+        )),
     }
 }
 
@@ -604,8 +772,9 @@ fn space_ok(bytes: u64) -> bool {
     bytes >= MIN_FREE_BYTES
 }
 
-fn prepare_checkout(iso_checkout: Option<&str>, workdir: &Path) -> Result<PathBuf, String> {    if let Some(dir) = iso_checkout {
-        let p = PathBuf::from(dir);
+fn prepare_checkout(iso_checkout: Option<&str>, workdir: &Path) -> Result<PathBuf, String> {
+    if let Some(dir) = iso_checkout {
+        let p = absolute_path(PathBuf::from(dir))?;
         if !p.join("builder/build-iso.sh").is_file() {
             return Err(format!("{} is not an omarchy-iso checkout", p.display()));
         }
@@ -626,7 +795,22 @@ fn prepare_checkout(iso_checkout: Option<&str>, workdir: &Path) -> Result<PathBu
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
     let clone_spin = output::spinner::spin("cloning omarchy-iso");
-    let r = system::run("git", &["clone", "--depth", "1", ISO_REPO, &workdir.to_string_lossy()])?;
+    let r = match system::run(
+        "git",
+        &[
+            "clone",
+            "--depth",
+            "1",
+            ISO_REPO,
+            &workdir.to_string_lossy(),
+        ],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            clone_spin.fail("cannot start omarchy-iso clone");
+            return Err(e);
+        }
+    };
     if r.status != 0 {
         clone_spin.fail("clone failed");
         return Err(format!("clone failed: {}", r.stderr.trim()));
@@ -637,7 +821,14 @@ fn prepare_checkout(iso_checkout: Option<&str>, workdir: &Path) -> Result<PathBu
 
 fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dst).map_err(|e| format!("cannot create {}: {e}", dst.display()))?;
-    let r = system::run("cp", &["-a", &format!("{}/.", src.display()), &dst.to_string_lossy()])?;
+    let r = system::run(
+        "cp",
+        &[
+            "-a",
+            &format!("{}/.", src.display()),
+            &dst.to_string_lossy(),
+        ],
+    )?;
     if r.status != 0 {
         return Err(format!("copy failed: {}", r.stderr.trim()));
     }
@@ -646,13 +837,32 @@ fn copy_dir(src: &Path, dst: &Path) -> Result<(), String> {
 
 /// Insert `addition` after the line containing `anchor` in `path`.
 /// Fails if the anchor is missing (upstream drift) or already applied.
-fn patch_after_anchor(path: &Path, marker: &str, anchor: &str, addition: &str) -> Result<(), String> {
-    let text =
-        std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+fn patch_after_anchor(
+    path: &Path,
+    marker: &str,
+    anchor: &str,
+    addition: &str,
+) -> Result<(), String> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     if text.contains(marker) {
         return Err(format!(
             "{} already patched (marker present); refusing to double-apply",
             path.display()
+        ));
+    }
+    let matches = text.match_indices(anchor).count();
+    if matches == 0 {
+        return Err(format!(
+            "anchor not found in {}: '{anchor}' — upstream omarchy-iso drifted; refusing to patch",
+            path.display()
+        ));
+    }
+    if matches > 1 {
+        return Err(format!(
+            "anchor is ambiguous in {} ({} matches): '{anchor}' — refusing to patch the wrong site",
+            path.display(),
+            matches
         ));
     }
     let idx = text.find(anchor).ok_or_else(|| {
@@ -661,12 +871,62 @@ fn patch_after_anchor(path: &Path, marker: &str, anchor: &str, addition: &str) -
             path.display()
         )
     })?;
-    let line_end = text[idx..].find('\n').map(|i| idx + i + 1).unwrap_or(text.len());
+    let line_end = text[idx..]
+        .find('\n')
+        .map(|i| idx + i + 1)
+        .unwrap_or(text.len());
     let mut patched = String::with_capacity(text.len() + addition.len());
     patched.push_str(&text[..line_end]);
     patched.push_str(addition);
     patched.push_str(&text[line_end..]);
     std::fs::write(path, patched).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn recipe_packages_extra(repo_pkgs: &[String]) -> Result<String, String> {
+    if repo_pkgs.is_empty() {
+        // Keep the file truly empty: the upstream patch uses [[ -s ]] as its
+        // guard, and a header-only file would trigger grep's no-match exit.
+        return Ok(String::new());
+    }
+    let mut extra = String::from("# Generated by omarchy-recipe build-iso. Do not edit.\n");
+    for p in repo_pkgs {
+        if !crate::aur::valid_pkg_name(p) {
+            return Err(format!("invalid repository package name: '{p}'"));
+        }
+        extra.push_str(p);
+        extra.push('\n');
+    }
+    Ok(extra)
+}
+
+fn apply_iso_patches(checkout: &Path) -> Result<(), String> {
+    let orch = checkout.join("configs/airootfs/usr/share/omarchy-iso/orchestrator");
+    let targets = [
+        checkout.join("builder/build-iso.sh"),
+        orch.join("main.py"),
+        orch.join("phases_impl.py"),
+    ];
+    let originals: Vec<(PathBuf, String)> = targets
+        .iter()
+        .map(|path| {
+            std::fs::read_to_string(path)
+                .map(|text| (path.clone(), text))
+                .map_err(|e| format!("cannot read {}: {e}", path.display()))
+        })
+        .collect::<Result<_, _>>()?;
+    let result = (|| {
+        patch_build_script(checkout)?;
+        patch_orchestrator(checkout)
+    })();
+    if let Err(error) = result {
+        // A missing later anchor must not leave an earlier patch applied in a
+        // caller-supplied checkout, making the next attempt refuse to run.
+        for (path, text) in originals {
+            let _ = std::fs::write(path, text);
+        }
+        return Err(error);
+    }
     Ok(())
 }
 
@@ -679,7 +939,7 @@ fn patch_build_script(checkout: &Path) -> Result<(), String> {
         r#"cp "${base_pkg_lists[1]}" "$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-other.packages""#,
         "\n# omarchy-recipe: ship recipe packages on target via _runtime_package_list.\n\
          if [[ -s /configs/recipe-packages.extra ]]; then\n\
-         \x20 grep -hv '^#\\|^$' /configs/recipe-packages.extra >> \"$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-base.packages\"\n\
+         \x20 grep -hv '^#\\|^$' /configs/recipe-packages.extra >> \"$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-base.packages\" || true\n\
          fi\n",
     )?;
     // 2. Fetch them into the offline mirror.
@@ -690,8 +950,10 @@ fn patch_build_script(checkout: &Path) -> Result<(), String> {
         "# omarchy-recipe: mirror recipe packages so pacstrap finds them offline.\n\
          if [[ -s /configs/recipe-packages.extra ]]; then\n\
          \x20 mapfile -t recipe_extra_pkgs < <(grep -hv '^#\\|^$' /configs/recipe-packages.extra | sort -u)\n\
-         \x20 all_packages+=(\"${recipe_extra_pkgs[@]}\")\n\
-         \x20 mapfile -t all_packages < <(printf '%s\\n' \"${all_packages[@]}\" | sort -u)\n\
+         \x20 if (( ${#recipe_extra_pkgs[@]} )); then\n\
+         \x20   all_packages+=(\"${recipe_extra_pkgs[@]}\")\n\
+         \x20   mapfile -t all_packages < <(printf '%s\\n' \"${all_packages[@]}\" | sort -u)\n\
+         \x20 fi\n\
          fi\n",
     )?;
     Ok(())
@@ -714,8 +976,8 @@ fn patch_orchestrator(checkout: &Path) -> Result<(), String> {
     )?;
     // 4. Append the stage_recipe implementation.
     let impl_path = orch.join("phases_impl.py");
-    let text =
-        std::fs::read_to_string(&impl_path).map_err(|e| format!("cannot read phases_impl.py: {e}"))?;
+    let text = std::fs::read_to_string(&impl_path)
+        .map_err(|e| format!("cannot read phases_impl.py: {e}"))?;
     if !text.contains("def stage_recipe(") {
         let mut new = text;
         if !new.ends_with('\n') {
@@ -741,10 +1003,27 @@ fn compat_sanity_check(impl_path: &Path) -> Result<(), String> {
     const NEW: &str = "        # omarchy-recipe compat: archinstall >= 4.5 dropped the `offline` kwarg.\n        installer.sanity_check(\n            skip_ntp=True,\n            skip_wkd=True,\n        )";
     let text = std::fs::read_to_string(impl_path)
         .map_err(|e| format!("cannot read {}: {e}", impl_path.display()))?;
-    if text.contains(NEW) || !text.contains(OLD) {
+    if text.contains(NEW) {
+        return Ok(());
+    }
+    if !text.contains(OLD) {
+        if text.contains("offline=True") || text.contains("offline = True") {
+            return Err(
+                "archinstall sanity_check still passes offline=True in an unrecognized shape; \
+                 upstream omarchy-iso drifted and the compatibility shim cannot safely patch it"
+                    .into(),
+            );
+        }
         return Ok(());
     }
     let patched = text.replacen(OLD, NEW, 1);
+    if patched.contains("offline=True") || patched.contains("offline = True") {
+        return Err(
+            "archinstall sanity_check still passes offline=True in an unrecognized shape; \
+             upstream omarchy-iso drifted and the compatibility shim cannot safely patch it"
+                .into(),
+        );
+    }
     std::fs::write(impl_path, patched)
         .map_err(|e| format!("cannot write {}: {e}", impl_path.display()))?;
     Ok(())
@@ -791,11 +1070,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let orch = dir.join("configs/airootfs/usr/share/omarchy-iso/orchestrator");
         std::fs::create_dir_all(&orch).unwrap();
-        std::fs::write(
-            dir.join("builder_placeholder"),
-            "",
-        )
-        .unwrap();
+        std::fs::write(dir.join("builder_placeholder"), "").unwrap();
         std::fs::create_dir_all(dir.join("builder")).unwrap();
         std::fs::write(
             dir.join("builder/build-iso.sh"),
@@ -827,20 +1102,37 @@ mod tests {
         assert!(build.contains("# omarchy-recipe: ship recipe packages"));
         assert!(build.contains("# omarchy-recipe: mirror recipe packages"));
         assert_eq!(build.matches("mkdir -p /tmp/offlinedb").count(), 1);
-        // Generated bash must parse.
-        let probe = dir.join("probe.sh");
-        std::fs::write(&probe, "#!/bin/bash\nall_packages=(a)\nbuild_cache_dir=/tmp/x\n".to_string() + &build[build.find("# omarchy-recipe: ship").unwrap()..build.find("mkdir -p /tmp/offlinedb").unwrap()]).unwrap();
-        let r = system::run("bash", &["-n", &probe.to_string_lossy()]).unwrap();
-        assert!(r.status == 0, "generated bash failed syntax check: {}", r.stderr);
+        // Generated bash must parse in full, including the mirror patch.
+        let build_path = dir.join("builder/build-iso.sh");
+        std::fs::write(&build_path, &build).unwrap();
+        let r = system::run("bash", &["-n", &build_path.to_string_lossy()]).unwrap();
+        assert!(
+            r.status == 0,
+            "generated bash failed syntax check: {}",
+            r.stderr
+        );
 
         let main = std::fs::read_to_string(orch.join("main.py")).unwrap();
         assert!(main.contains("stage_recipe,"));
         assert!(main.contains("Applying machine recipe"));
-        let impl_py = std::fs::read_to_string(orch.join("phases_impl.py")).unwrap();
+        let impl_path = orch.join("phases_impl.py");
+        let impl_py = std::fs::read_to_string(&impl_path).unwrap();
         assert!(impl_py.contains("def stage_recipe("));
-        // Embedded python must parse.
-        let r = system::run("python3", &["-c", &format!("import ast; ast.parse({})", serde_json::to_string(&format!("{impl_py}\n")).unwrap())]);
-        assert!(r.unwrap().status == 0, "generated python failed syntax check");
+        // Parse the generated Python file itself, not a JSON string literal.
+        let r = system::run(
+            "python3",
+            &[
+                "-c",
+                "import ast, pathlib, sys; ast.parse(pathlib.Path(sys.argv[1]).read_text())",
+                &impl_path.to_string_lossy(),
+            ],
+        );
+        let r = r.unwrap();
+        assert!(
+            r.status == 0,
+            "generated python failed syntax check: {}",
+            r.stderr
+        );
     }
 
     #[test]
@@ -932,13 +1224,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let log = dir.join("bake.log");
-        std::fs::write(&log, "Cloning into x\nTarget install resolves to 900 packages.\n")
-            .unwrap();
+        std::fs::write(
+            &log,
+            "Cloning into x\nTarget install resolves to 900 packages.\n",
+        )
+        .unwrap();
         let sp = output::spinner::spin("pump");
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let status = pump_log(&log, &sp, &mut child).unwrap();
         assert!(status.success());
         sp.succeed(None);
+    }
+
+    #[test]
+    fn empty_repo_list_produces_truly_empty_extra_file() {
+        assert!(recipe_packages_extra(&[]).unwrap().is_empty());
+        assert!(recipe_packages_extra(&["foo".into()])
+            .unwrap()
+            .contains("foo\n"));
+        assert!(recipe_packages_extra(&["../evil".into()]).is_err());
+        assert!(recipe_packages_extra(&["..".into()]).is_err());
+        assert!(recipe_packages_extra(&["-foo".into()]).is_err());
+    }
+
+    #[test]
+    fn ambiguous_anchor_is_rejected() {
+        let dir = system::temp_dir("omr-iso-ambiguous").unwrap();
+        let p = dir.join("script.sh");
+        std::fs::write(&p, "ANCHOR\nANCHOR\n").unwrap();
+        assert!(patch_after_anchor(&p, "# marker", "ANCHOR", "added\n").is_err());
+    }
+
+    #[test]
+    fn compat_fails_loudly_on_unrecognized_offline_kwarg() {
+        let dir = system::temp_dir("omr-compat-unknown").unwrap();
+        let p = dir.join("phases_impl.py");
+        std::fs::write(&p, "installer.sanity_check(offline=True, skip_ntp=True)\n").unwrap();
+        assert!(compat_sanity_check(&p).is_err());
+    }
+
+    #[test]
+    fn missing_or_stale_iso_is_not_success() {
+        let dir = system::temp_dir("omr-iso-output").unwrap();
+        std::fs::create_dir_all(dir.join("release")).unwrap();
+        let now = std::time::SystemTime::now();
+        assert!(newest_iso(&dir, now).is_err());
+        std::fs::write(dir.join("release/old.iso"), b"old").unwrap();
+        let future = now + std::time::Duration::from_secs(60);
+        assert!(newest_iso(&dir, future).is_err());
+    }
+
+    #[test]
+    fn log_drain_handles_carriage_returns_and_bounds_partial_lines() {
+        let mut pending = "one\rtwo\nthree".to_string();
+        let mut lines = vec![];
+        drain_log_lines(&mut pending, |line| lines.push(line.to_string()));
+        assert_eq!(lines, vec!["one", "two"]);
+        assert_eq!(pending, "three");
+
+        pending.push_str(&"x".repeat(1024 * 1024 + 1));
+        drain_log_lines(&mut pending, |line| lines.push(line.to_string()));
+        assert!(pending.is_empty());
+        assert_eq!(lines.len(), 3);
+    }
+
+    #[test]
+    fn pinned_container_image_from_upstream_wrapper_wins() {
+        let dir = system::temp_dir("omr-container-image").unwrap();
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        std::fs::write(
+            dir.join("bin/omarchy-iso-make"),
+            "#!/bin/bash\nCONTAINER_IMAGE=\"example/pinned@sha256:abc\"\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("Dockerfile"), "FROM fallback:latest\n").unwrap();
+        assert_eq!(docker_base_image(&dir), "example/pinned@sha256:abc");
+    }
+
+    #[test]
+    fn relative_workdir_is_resolved_against_cwd() {
+        let resolved = absolute_path(PathBuf::from("build")).unwrap();
+        assert!(resolved.is_absolute());
+        assert_eq!(resolved, std::env::current_dir().unwrap().join("build"));
+    }
+
+    #[test]
+    fn patch_failure_rolls_back_earlier_files() {
+        let dir = system::temp_dir("omr-iso-rollback").unwrap();
+        let orch = dir.join("configs/airootfs/usr/share/omarchy-iso/orchestrator");
+        std::fs::create_dir_all(dir.join("builder")).unwrap();
+        std::fs::create_dir_all(&orch).unwrap();
+        let build = dir.join("builder/build-iso.sh");
+        let build_text = "cp \"${base_pkg_lists[1]}\" \"$build_cache_dir/airootfs/usr/share/omarchy-iso/omarchy-other.packages\"\nmkdir -p /tmp/offlinedb\n";
+        std::fs::write(&build, build_text).unwrap();
+        std::fs::write(orch.join("main.py"), "# no anchors\n").unwrap();
+        std::fs::write(orch.join("phases_impl.py"), "# original\n").unwrap();
+        assert!(apply_iso_patches(&dir).is_err());
+        assert_eq!(std::fs::read_to_string(build).unwrap(), build_text);
     }
 
     #[test]
@@ -962,37 +1344,24 @@ mod boot_launch_tests {
 
     #[test]
     fn boot_invokes_helper_with_iso_path() {
-        let dir = std::env::temp_dir().join("omr-boot-launch");
-        let _ = std::fs::remove_dir_all(&dir);
-        let mockbin = dir.join("mockbin");
+        let dir = system::temp_dir("omr-boot-launch").unwrap();
         let bindir = dir.join("checkout/bin");
-        std::fs::create_dir_all(&mockbin).unwrap();
         std::fs::create_dir_all(&bindir).unwrap();
-        std::fs::write(mockbin.join("qemu-system-x86_64"), "#!/bin/sh\nexit 0\n").unwrap();
         let sentinel = dir.join("booted.txt");
         std::fs::write(
             bindir.join("omarchy-iso-boot"),
             format!("#!/bin/sh\necho \"$1\" > {}\n", sentinel.display()),
         )
         .unwrap();
-        for f in [
-            mockbin.join("qemu-system-x86_64"),
+        std::fs::set_permissions(
             bindir.join("omarchy-iso-boot"),
-        ] {
-            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o755)).unwrap();
-        }
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
         let iso = dir.join("test.iso");
         std::fs::write(&iso, b"fake").unwrap();
 
-        // Prepend mocks; restore PATH before asserting so a failure cannot
-        // pollute sibling tests running in other threads.
-        let old_path = std::env::var_os("PATH").unwrap_or_default();
-        let mut paths: Vec<_> = std::env::split_paths(&old_path).collect();
-        paths.insert(0, mockbin);
-        std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
-        maybe_boot(crate::cli::BootWhen::Yes, &dir.join("checkout"), &iso);
-        std::env::set_var("PATH", &old_path);
-
+        launch_boot(&bindir.join("omarchy-iso-boot"), &iso).unwrap();
         let got = std::fs::read_to_string(&sentinel).unwrap();
         assert_eq!(got.trim(), iso.display().to_string());
     }

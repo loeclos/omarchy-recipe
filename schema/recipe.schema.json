@@ -34,7 +34,8 @@
         "required": ["name", "file"],
         "properties": {
           "name": { "type": "string" },
-          "file": { "type": "string" }
+          "file": { "type": "string" },
+          "sha256": { "type": "string", "pattern": "^[0-9a-fA-F]{64}$" }
         }
       }
     },

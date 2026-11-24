@@ -58,13 +58,16 @@ chmod +x "$MOCKBIN"/*
 export HOME="$WORK/homeA"
 mkdir -p "$HOME/.config/omarchy/themes" "$HOME/.config/nvim" \
   "$HOME/.config/hypr" "$HOME/.config/omarchy/themes/tokyo-night" \
-  "$HOME/.config/yay" "$HOME/.local/share/applications" \
+  "$HOME/.config/yay" "$HOME/.config/google-chrome/Default/Cache" \
+  "$HOME/.local/share/applications" "$HOME/.local/share/icons/hicolor/256x256/apps" \
   "$HOME/.local/state/omarchy/current" "$HOME/.config/omarchy"
 printf 'tokyo-night' >"$HOME/.local/state/omarchy/current/theme.name"
 printf 'set nocompatible\n' >"$HOME/.config/nvim/init.vim"
 printf '{"version":1}\n' >"$HOME/.config/omarchy/shell.json"
 printf '$monitor = eDP-1\n' >"$HOME/.config/hypr/monitors.conf"
 printf 'should-be-excluded\n' >"$HOME/.config/yay/cache-file"
+printf 'should-be-excluded\n' >"$HOME/.config/google-chrome/Default/Cache/data"
+printf 'icon\n' >"$HOME/.local/share/icons/hicolor/256x256/apps/testapp.png"
 printf '[Desktop Entry]\nName=TestApp\nExec=xdg-open https://example.com\n' \
   >"$HOME/.local/share/applications/testapp.desktop"
 export OMARCHY_PATH="$WORK/omarchy-a"
@@ -82,11 +85,14 @@ jq -e '.packages.aur == ["aur-pkg"]' "$WORK/a.recipe/recipe.json" >/dev/null \
   || { echo "FAIL: aur list wrong" >&2; exit 1; }
 jq -e '(.webapps|length) == 1' "$WORK/a.recipe/recipe.json" >/dev/null \
   || { echo "FAIL: webapps not recorded" >&2; exit 1; }
-if tar --zstd -tf "$WORK/a.recipe/dotfiles.tar.zst" 2>/dev/null | grep -q 'yay/cache-file'; then
-  echo "FAIL: blocklisted yay cache leaked into tarball" >&2; exit 1
+if tar --zstd -tf "$WORK/a.recipe/dotfiles.tar.zst" 2>/dev/null | grep -q 'yay/cache-file\|google-chrome\|hypr/monitors.conf'; then
+  echo "FAIL: blocklisted config leaked into tarball" >&2; exit 1
 fi
 if ! tar --zstd -tf "$WORK/a.recipe/dotfiles.tar.zst" 2>/dev/null | grep -q 'testapp.desktop'; then
   echo "FAIL: webapp .desktop not shipped in tarball" >&2; exit 1
+fi
+if ! tar --zstd -tf "$WORK/a.recipe/dotfiles.tar.zst" 2>/dev/null | grep -q 'icons/hicolor/256x256/apps/testapp.png'; then
+  echo "FAIL: webapp icon not shipped in tarball" >&2; exit 1
 fi
 
 # --- blacklist export ---
@@ -114,6 +120,13 @@ printf 'y\n' | "$BIN" import "$WORK/a.recipe" --skip-packages >/dev/null
   || { echo "FAIL: webapp desktop not restored" >&2; exit 1; }
 grep -q 'HDMI-A-1' "$HOME/.config/hypr/monitors.conf" \
   || { echo "FAIL: B monitor config was clobbered" >&2; exit 1; }
+
+# A fresh target has no monitor config; it must not inherit machine A's layout.
+export HOME="$WORK/homeB-fresh"
+mkdir -p "$HOME"
+"$BIN" import "$WORK/a.recipe" --yes --skip-packages >/dev/null
+[[ ! -e $HOME/.config/hypr/monitors.conf ]] \
+  || { echo "FAIL: fresh target inherited source monitor config" >&2; exit 1; }
 
 # --- v1 bundle still imports ---
 mkdir -p "$WORK/v1.recipe" "$WORK/v1files"
@@ -150,5 +163,18 @@ export HOME="$WORK/homeD"
 mkdir -p "$HOME"
 "$BIN" import "$WORK/s.recipe" --yes --skip-packages >/dev/null 2>&1
 [[ -f $HOME/.ssh/id_test ]] || { echo "FAIL: secrets not restored on import" >&2; exit 1; }
+[[ $(stat -c '%a' "$HOME/.ssh") == 700 ]] \
+  || { echo "FAIL: restored .ssh directory is not private" >&2; exit 1; }
+[[ $(stat -c '%a' "$HOME/.ssh/id_test") == 600 ]] \
+  || { echo "FAIL: restored SSH key is not private" >&2; exit 1; }
+
+# Package-query failures must abort export instead of silently writing an empty list.
+FAILBIN="$WORK/failbin"
+mkdir -p "$FAILBIN"
+printf '#!/bin/bash\nexit 1\n' >"$FAILBIN/pacman"
+chmod +x "$FAILBIN/pacman"
+if PATH="$FAILBIN:$PATH" "$BIN" export --out "$WORK/fail.recipe" >/dev/null 2>&1; then
+  echo "FAIL: export succeeded after pacman query failure" >&2; exit 1
+fi
 
 echo "PASS: roundtrip"

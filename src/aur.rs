@@ -3,7 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::output;
-use crate::recipe::VendoredPkg;
+use crate::recipe::{sha256_file, VendoredPkg};
 use crate::system;
 
 /// Vendor AUR packages: build (or reuse) .pkg.tar.zst files into
@@ -18,17 +18,23 @@ pub fn vendor(
     pkgdir: Option<&str>,
 ) -> Result<Vec<VendoredPkg>, String> {
     let dest = bundle.join("aur-pkgs");
-    std::fs::create_dir_all(&dest)
-        .map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
+    std::fs::create_dir_all(&dest).map_err(|e| format!("cannot create {}: {e}", dest.display()))?;
 
     let mut out = vec![];
     for pkg in pkgs {
+        if !valid_pkg_name(pkg) {
+            return Err(format!("invalid AUR package name: '{pkg}'"));
+        }
         output::info(&format!("Vendoring AUR package: {pkg}"));
-        let file = ensure_pkg(pkg, &dest, pkgdir)?;
-        out.push(VendoredPkg {
-            name: pkg.clone(),
-            file: format!("aur-pkgs/{file}"),
-        });
+        let files = ensure_pkg(pkg, &dest, pkgdir)?;
+        for file in files {
+            let hash = sha256_file(&dest.join(&file))?;
+            out.push(VendoredPkg {
+                name: pkg.clone(),
+                file: format!("aur-pkgs/{file}"),
+                sha256: Some(hash),
+            });
+        }
     }
 
     // Index the repo so pacman -U/-S can resolve the set (unsigned: local files).
@@ -58,27 +64,45 @@ pub fn vendor(
     Ok(out)
 }
 
-fn ensure_pkg(pkg: &str, dest: &Path, pkgdir: Option<&str>) -> Result<String, String> {
+pub(crate) fn valid_pkg_name(pkg: &str) -> bool {
+    let mut bytes = pkg.bytes();
+    matches!(bytes.next(), Some(b) if b.is_ascii_alphanumeric())
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'@' | b'-'))
+}
+
+fn ensure_pkg(pkg: &str, dest: &Path, pkgdir: Option<&str>) -> Result<Vec<String>, String> {
     if let Some(dir) = pkgdir {
-        if let Some(hit) = find_prebuilt(Path::new(dir), pkg) {
-            let name = hit.file_name().unwrap().to_string_lossy().to_string();
-            std::fs::copy(&hit, dest.join(&name))
-                .map_err(|e| format!("cannot copy prebuilt {pkg}: {e}"))?;
-            output::info(&format!("Reusing prebuilt {name}"));
-            return Ok(name);
+        let hits = find_prebuilt(Path::new(dir), pkg);
+        if !hits.is_empty() {
+            let mut names = vec![];
+            for hit in hits {
+                let name = hit
+                    .file_name()
+                    .ok_or_else(|| format!("prebuilt package has no filename: {}", hit.display()))?
+                    .to_string_lossy()
+                    .to_string();
+                std::fs::copy(&hit, dest.join(&name))
+                    .map_err(|e| format!("cannot copy prebuilt {pkg}: {e}"))?;
+                output::info(&format!("Reusing prebuilt {name}"));
+                names.push(name);
+            }
+            return Ok(names);
         }
         output::warn(&format!("no prebuilt file for {pkg} in {dir}; building"));
     }
     build_pkg(pkg, dest)
 }
 
-fn find_prebuilt(dir: &Path, pkg: &str) -> Option<PathBuf> {
-    let entries = std::fs::read_dir(dir).ok()?;
+fn find_prebuilt(dir: &Path, pkg: &str) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return vec![];
+    };
     let mut hits: Vec<PathBuf> = entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.extension().map(|e| e == "zst").unwrap_or(false)
+            p.is_file()
+                && p.extension().map(|e| e == "zst").unwrap_or(false)
                 && p.file_name()
                     .map(|n| {
                         let n = n.to_string_lossy();
@@ -88,10 +112,44 @@ fn find_prebuilt(dir: &Path, pkg: &str) -> Option<PathBuf> {
         })
         .collect();
     hits.sort();
-    hits.into_iter().next()
+    // Keep every split-package artifact, but only the newest matching version
+    // of each artifact name. Passing two versions of one package to pacman -U
+    // would make the install fail.
+    let mut newest: std::collections::HashMap<String, (String, PathBuf)> =
+        std::collections::HashMap::new();
+    for path in hits {
+        let Some(file) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(stem) = file.strip_suffix(".pkg.tar.zst") else {
+            continue;
+        };
+        let parts: Vec<&str> = stem.rsplitn(4, '-').collect();
+        if parts.len() != 4 {
+            continue;
+        }
+        let name = parts[3].to_string();
+        let version = format!("{}-{}-{}", parts[2], parts[1], parts[0]);
+        let current = newest.get(&name).map(|(version, _)| version.as_str());
+        let newer = match current {
+            Some(current) => system::run("vercmp", &[current, &version])
+                .ok()
+                .filter(|result| result.status == 0)
+                .map(|result| result.stdout.trim() == "-1")
+                .unwrap_or_else(|| version.as_str() > current),
+            None => true,
+        };
+        if !newer {
+            continue;
+        }
+        newest.insert(name, (version, path));
+    }
+    let mut selected: Vec<PathBuf> = newest.into_values().map(|(_, path)| path).collect();
+    selected.sort();
+    selected
 }
 
-fn build_pkg(pkg: &str, dest: &Path) -> Result<String, String> {
+fn build_pkg(pkg: &str, dest: &Path) -> Result<Vec<String>, String> {
     if is_root() {
         return Err(format!(
             "cannot build AUR package '{pkg}' as root (makepkg refuses). \
@@ -100,22 +158,33 @@ fn build_pkg(pkg: &str, dest: &Path) -> Result<String, String> {
     }
     for tool in ["makepkg", "git"] {
         if !system::cmd_exists(tool) {
-            return Err(format!("'{tool}' not found; needed to build AUR package '{pkg}'"));
+            return Err(format!(
+                "'{tool}' not found; needed to build AUR package '{pkg}'"
+            ));
         }
     }
-    let work = std::env::temp_dir().join(format!("omr-aur-{}-{}", pkg, std::process::id()));
+    let build_root = system::home_dir()
+        .map(|home| home.join(".cache/omarchy-recipe/aur-build"))
+        .unwrap_or_else(std::env::temp_dir);
+    let work = system::unique_dir(&build_root, "omr-aur")?;
     let srcdir = work.join(pkg);
-    std::fs::create_dir_all(&work).map_err(|e| format!("cannot create workdir: {e}"))?;
 
     // Fetch PKGBUILD: prefer yay -G, fall back to AUR git.
     let fetched = if system::cmd_exists("yay") {
-        system::run_in(&work, "yay", &["-G", pkg]).map(|r| r.status == 0).unwrap_or(false)
+        system::run_in(&work, "yay", &["-G", pkg])
+            .map(|r| r.status == 0)
+            .unwrap_or(false)
     } else {
         false
     } || system::run_in(
         &work,
         "git",
-        &["clone", &format!("https://aur.archlinux.org/{pkg}.git")],
+        &[
+            "clone",
+            "--",
+            &format!("https://aur.archlinux.org/{pkg}.git"),
+            &srcdir.to_string_lossy(),
+        ],
     )
     .map(|r| r.status == 0)
     .unwrap_or(false);
@@ -124,29 +193,37 @@ fn build_pkg(pkg: &str, dest: &Path) -> Result<String, String> {
         return Err(format!("cannot fetch AUR sources for '{pkg}'"));
     }
 
-    output::info(&format!("Building {pkg} (makepkg -sf; sudo may prompt for deps) ..."));
+    output::info(&format!(
+        "Building {pkg} (makepkg -sf; sudo may prompt for deps) ..."
+    ));
     let build_spin = output::spinner::spin(&format!("building {pkg}"));
-    let r = system::run_in(&srcdir, "makepkg", &["--noconfirm", "-sf"])?;
+    let r = match system::run_in(&srcdir, "makepkg", &["--noconfirm", "-sf"]) {
+        Ok(r) => r,
+        Err(e) => {
+            build_spin.fail(&format!("cannot run makepkg for {pkg}"));
+            std::fs::remove_dir_all(&work).ok();
+            return Err(e);
+        }
+    };
     if r.status != 0 {
         build_spin.fail(&format!("makepkg failed for {pkg}"));
         std::fs::remove_dir_all(&work).ok();
         return Err(format!("makepkg failed for '{pkg}': {}", tail(&r.stderr)));
     }
     build_spin.succeed(None);
-    // Collect exactly this package's artifacts (split packages possible).
+    // Collect every artifact from this PKGBUILD, including split packages.
     let mut built: Vec<PathBuf> = std::fs::read_dir(&srcdir)
         .map_err(|e| format!("cannot list build dir: {e}"))?
         .flatten()
         .map(|e| e.path())
         .filter(|p| {
-            p.file_name()
-                .map(|n| {
-                    let n = n.to_string_lossy();
-                    n.starts_with(&format!("{pkg}-"))
-                        && n.contains(".pkg.tar.")
-                        && !n.ends_with(".sig")
-                })
-                .unwrap_or(false)
+            p.is_file()
+                && p.file_name()
+                    .map(|n| {
+                        let n = n.to_string_lossy();
+                        n.contains(".pkg.tar.") && !n.ends_with(".sig")
+                    })
+                    .unwrap_or(false)
         })
         .collect();
     built.sort();
@@ -154,17 +231,29 @@ fn build_pkg(pkg: &str, dest: &Path) -> Result<String, String> {
         std::fs::remove_dir_all(&work).ok();
         return Err(format!("makepkg produced no package file for '{pkg}'"));
     }
+    let mut names = vec![];
     for b in &built {
-        let name = b.file_name().unwrap().to_string_lossy().to_string();
+        let name = b
+            .file_name()
+            .ok_or_else(|| format!("built package has no filename: {}", b.display()))?
+            .to_string_lossy()
+            .to_string();
         std::fs::copy(b, dest.join(&name)).map_err(|e| format!("cannot collect {name}: {e}"))?;
+        names.push(name);
     }
-    let first = built[0].file_name().unwrap().to_string_lossy().to_string();
     std::fs::remove_dir_all(&work).ok();
-    Ok(first)
+    Ok(names)
 }
 
 fn tail(s: &str) -> String {
-    s.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join("\n")
+    s.lines()
+        .rev()
+        .take(5)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 fn is_root() -> bool {
@@ -184,8 +273,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("foo-1.0-1-x86_64.pkg.tar.zst"), b"x").unwrap();
         std::fs::write(dir.join("foobar-2.0-1-x86_64.pkg.tar.zst"), b"x").unwrap();
-        let hit = find_prebuilt(&dir, "foo").unwrap();
-        assert!(hit.ends_with("foo-1.0-1-x86_64.pkg.tar.zst"));
+        let hits = find_prebuilt(&dir, "foo");
+        assert_eq!(hits.len(), 1);
+        assert!(hits[0].ends_with("foo-1.0-1-x86_64.pkg.tar.zst"));
     }
 
     #[test]
@@ -195,9 +285,40 @@ mod tests {
         let bundle = dir.join("bundle");
         std::fs::create_dir_all(&pkgdir).unwrap();
         std::fs::write(pkgdir.join("foo-1.0-1-x86_64.pkg.tar.zst"), b"fake").unwrap();
-        let out = vendor(&["foo".to_string()], &bundle, Some(pkgdir.to_str().unwrap())).unwrap();
+        let out = vendor(
+            &["foo".to_string()],
+            &bundle,
+            Some(pkgdir.to_str().unwrap()),
+        )
+        .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].file, "aur-pkgs/foo-1.0-1-x86_64.pkg.tar.zst");
+        assert!(out[0].sha256.as_deref().is_some_and(|s| s.len() == 64));
         assert!(bundle.join(&out[0].file).is_file());
+    }
+
+    #[test]
+    fn vendor_reuses_all_split_package_artifacts() {
+        let dir = system::temp_dir("omr-aur-split").unwrap();
+        let pkgdir = dir.join("prebuilt");
+        let bundle = dir.join("bundle");
+        std::fs::create_dir_all(&pkgdir).unwrap();
+        std::fs::write(pkgdir.join("foo-1.0-1-x86_64.pkg.tar.zst"), b"fake").unwrap();
+        std::fs::write(pkgdir.join("foo-tools-1.0-1-x86_64.pkg.tar.zst"), b"fake").unwrap();
+        std::fs::write(pkgdir.join("foo-2.0-1-x86_64.pkg.tar.zst"), b"new").unwrap();
+        let out = vendor(
+            &["foo".to_string()],
+            &bundle,
+            Some(pkgdir.to_str().unwrap()),
+        )
+        .unwrap();
+        assert_eq!(out.len(), 2);
+        assert!(out
+            .iter()
+            .any(|pkg| pkg.file.ends_with("foo-2.0-1-x86_64.pkg.tar.zst")));
+        assert!(!out
+            .iter()
+            .any(|pkg| pkg.file.ends_with("foo-1.0-1-x86_64.pkg.tar.zst")));
+        assert!(out.iter().all(|pkg| bundle.join(&pkg.file).is_file()));
     }
 }

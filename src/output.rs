@@ -3,6 +3,7 @@
 //! - `info` is chatty detail, hidden under `--quiet`.
 //! - `stage(i, n, msg)` is the always-visible progress spine: `[i/n] msg`.
 //! - `summary` renders the end-of-run info panel.
+//!
 //! Colors honor NO_COLOR, dumb terminals, and non-ttys.
 
 use std::io::IsTerminal;
@@ -76,15 +77,13 @@ pub fn num(n: usize) -> String {
 
 /// Numbered stage header. Always visible, even in quiet mode.
 pub fn stage(i: usize, n: usize, msg: &str) {
-    spinner::clear_active();
     let tag = bold_cyan(&format!("[{i}/{n}]"));
-    println!("{} {}", tag, bold(msg));
+    print_line(&format!("{} {}", tag, bold(msg)));
 }
 
 /// Unnumbered step (section headers that don't fit the i/n spine).
 pub fn step(msg: &str) {
-    spinner::clear_active();
-    println!("{} {}", bold_cyan("==>"), bold(msg));
+    print_line(&format!("{} {}", bold_cyan("==>"), bold(msg)));
 }
 
 /// Chatty detail. Hidden under --quiet.
@@ -92,13 +91,36 @@ pub fn info(msg: &str) {
     if is_quiet() {
         return;
     }
-    spinner::clear_active();
-    println!("{} {}", dim(" ->"), msg);
+    print_line(&format!("{} {}", dim(" ->"), msg));
 }
 
 pub fn ok(msg: &str) {
-    spinner::clear_active();
-    println!("{} {}", bold_green("✓"), msg);
+    print_line(&format!("{} {}", bold_green("✓"), msg));
+}
+
+/// Print one complete stdout line without allowing the animation thread to
+/// draw a frame between clearing and printing.
+pub fn print_line(msg: &str) {
+    let _guard = spinner::lock_line();
+    spinner::clear_active_locked();
+    println!("{msg}");
+}
+
+/// Prompt on a clean line, then read stdin after releasing the output lock.
+pub fn prompt(msg: &str) -> Result<String, String> {
+    use std::io::Write;
+
+    {
+        let _guard = spinner::lock_line();
+        spinner::clear_active_locked();
+        print!("{msg}");
+        std::io::stdout().flush().map_err(|e| e.to_string())?;
+    }
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .map_err(|e| e.to_string())?;
+    Ok(answer)
 }
 
 pub fn warn(msg: &str) {
@@ -124,7 +146,9 @@ pub fn die(msg: &str) -> ! {
 /// │ key   value │
 /// ╰─────────╯
 pub fn summary(title: &str, rows: &[(&str, String)]) {
-    spinner::clear_active();    let key_w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
+    let _guard = spinner::lock_line();
+    spinner::clear_active_locked();
+    let key_w = rows.iter().map(|(k, _)| k.len()).max().unwrap_or(0);
     let val_w = rows
         .iter()
         .map(|(_, v)| strip_ansi(v).len())
@@ -134,7 +158,15 @@ pub fn summary(title: &str, rows: &[(&str, String)]) {
     let width = inner.max(strip_ansi(title).len() + 2);
 
     println!("{}", green(&format!("╭─{}─╮", "─".repeat(width))));
-    println!("{} {} {}", green("│"), bold(title), green(&format!("{}│", " ".repeat(width.saturating_sub(strip_ansi(title).len())))));
+    println!(
+        "{} {} {}",
+        green("│"),
+        bold(title),
+        green(&format!(
+            "{}│",
+            " ".repeat(width.saturating_sub(strip_ansi(title).len()))
+        ))
+    );
     println!("{}", green(&format!("├─{}─┤", "─".repeat(width))));
     for (k, v) in rows {
         let plain_len = k.len() + 1 + strip_ansi(v).len();
@@ -192,9 +224,11 @@ mod tests {
         stage(1, 2, "staged");
         set_quiet(false);
         assert!(!is_quiet());
-        summary("test", &[("key", "value".to_string()), ("longer-key", num(42))]);
+        summary(
+            "test",
+            &[("key", "value".to_string()), ("longer-key", num(42))],
+        );
     }
-
 }
 
 /// Animated step spinners.
@@ -245,12 +279,6 @@ pub mod spinner {
             eprint!("\r\x1b[K");
             let _ = std::io::stderr().flush();
         }
-    }
-
-    /// Erase the in-progress spinner line, locking.
-    pub(crate) fn clear_active() {
-        let _guard = lock_line();
-        clear_active_locked();
     }
 
     pub fn fmt_elapsed(d: Duration) -> String {
@@ -328,13 +356,17 @@ pub mod spinner {
                 if !p2.load(Ordering::Relaxed) {
                     let text = d2.lock().map(|g| g.clone()).unwrap_or_default();
                     let _guard = lock_line();
-                    eprint!(
-                        "\r  {} {} ({})   ",
-                        FRAMES[i % FRAMES.len()],
-                        text,
-                        fmt_elapsed(start.elapsed())
-                    );
-                    let _ = std::io::stderr().flush();
+                    // Re-check after acquiring the lock: pause() may have
+                    // cleared the line while this frame was waiting.
+                    if !p2.load(Ordering::Relaxed) {
+                        eprint!(
+                            "\r  {} {} ({})   ",
+                            FRAMES[i % FRAMES.len()],
+                            text,
+                            fmt_elapsed(start.elapsed())
+                        );
+                        let _ = std::io::stderr().flush();
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(80));
                 i += 1;
@@ -482,10 +514,7 @@ pub mod spinner {
             sp.advance("one");
             sp.advance("one"); // repeat marker: no duplicate history
             sp.advance("two");
-            assert_eq!(
-                sp.history(),
-                vec!["phases".to_string(), "one".to_string()]
-            );
+            assert_eq!(sp.history(), vec!["phases".to_string(), "one".to_string()]);
             sp.succeed(None);
         }
 

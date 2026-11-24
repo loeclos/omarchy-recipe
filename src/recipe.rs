@@ -123,6 +123,10 @@ pub struct Dotfiles {
 pub struct VendoredPkg {
     pub name: String,
     pub file: String,
+    /// Integrity hash for newly-written v2 bundles. Optional so v1/v2 bundles
+    /// created before hashes were recorded remain readable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -163,7 +167,14 @@ fn default_wifi() -> String {
 
 impl Recipe {
     /// Parse recipe.json, accepting v1 (migrated) and v2.
+    #[cfg(test)]
     pub fn load(path: &Path) -> Result<Recipe, String> {
+        Self::load_with_version(path).map(|(recipe, _)| recipe)
+    }
+
+    /// Same as [`Recipe::load`], but retains the source schema version so
+    /// validation can apply narrow compatibility exceptions for v1 bundles.
+    pub fn load_with_version(path: &Path) -> Result<(Recipe, u32), String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
         let v: serde_json::Value =
@@ -174,13 +185,15 @@ impl Recipe {
             .ok_or_else(|| "recipe.json missing schema_version".to_string())?;
         match version {
             1 => {
-                let mut r: Recipe = serde_json::from_value(v)
-                    .map_err(|e| format!("schema v1 parse error: {e}"))?;
+                let mut r: Recipe =
+                    serde_json::from_value(v).map_err(|e| format!("schema v1 parse error: {e}"))?;
                 r.schema_version = 2;
                 r.selection = Selection::default();
-                Ok(r)
+                Ok((r, 1))
             }
-            2 => serde_json::from_value(v).map_err(|e| format!("schema v2 parse error: {e}")),
+            2 => serde_json::from_value(v)
+                .map(|recipe| (recipe, 2))
+                .map_err(|e| format!("schema v2 parse error: {e}")),
             n => Err(format!(
                 "unsupported schema_version {n} (this tool handles 1 and 2)"
             )),
@@ -207,23 +220,74 @@ pub fn resolve_bundle_dir(arg: Option<&str>) -> Result<PathBuf, String> {
     Ok(dir)
 }
 
-/// Effective tarball path (bundle-relative unless absolute).
-pub fn tarball_path(bundle: &Path, recipe: &Recipe) -> PathBuf {
-    let f = PathBuf::from(&recipe.dotfiles.file);
-    if f.is_absolute() {
-        f
-    } else {
-        bundle.join(f)
+/// Resolve a bundle-relative path without allowing archives to escape the
+/// bundle through absolute paths or `..` components.
+pub fn bundle_path(bundle: &Path, relative: &Path) -> Result<PathBuf, String> {
+    use std::path::Component;
+
+    if relative.as_os_str().is_empty() {
+        return Err("bundle file path is empty".into());
     }
+    if relative.is_absolute() {
+        return Err(format!(
+            "bundle file path must be relative: {}",
+            relative.display()
+        ));
+    }
+    for component in relative.components() {
+        if !matches!(component, Component::Normal(_)) {
+            return Err(format!(
+                "unsafe bundle file path '{}': only relative paths inside the bundle are allowed",
+                relative.display()
+            ));
+        }
+    }
+    if bundle.is_dir() {
+        let base = bundle
+            .canonicalize()
+            .map_err(|e| format!("cannot resolve {}: {e}", bundle.display()))?;
+        let joined = base.join(relative);
+        if joined.exists() {
+            let resolved = joined
+                .canonicalize()
+                .map_err(|e| format!("cannot resolve {}: {e}", joined.display()))?;
+            if !resolved.starts_with(&base) {
+                return Err(format!(
+                    "bundle file path escapes the bundle through a symlink: {}",
+                    relative.display()
+                ));
+            }
+        }
+        return Ok(joined);
+    }
+    Ok(bundle.join(relative))
 }
 
-/// sha256 hex of a file.
+/// Effective tarball path (bundle-relative and confined to the bundle).
+pub fn tarball_path(bundle: &Path, recipe: &Recipe) -> Result<PathBuf, String> {
+    bundle_path(bundle, Path::new(&recipe.dotfiles.file))
+}
+
+/// sha256 hex of a file, streamed so large dotfiles archives do not have to fit
+/// in memory.
 pub fn sha256_file(path: &Path) -> Result<String, String> {
     use sha2::{Digest, Sha256};
-    let bytes =
-        std::fs::read(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    use std::io::Read;
+
+    let file =
+        std::fs::File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+    let mut reader = std::io::BufReader::new(file);
     let mut h = Sha256::new();
-    h.update(&bytes);
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
     Ok(format!("{:x}", h.finalize()))
 }
 
@@ -276,6 +340,27 @@ mod tests {
     }
 
     #[test]
+    fn bundle_paths_stay_inside_bundle() {
+        let bundle = Path::new("/tmp/example.recipe");
+        assert_eq!(
+            bundle_path(bundle, Path::new("aur-pkgs/foo.zst")).unwrap(),
+            bundle.join("aur-pkgs/foo.zst")
+        );
+        assert!(bundle_path(bundle, Path::new("../outside")).is_err());
+        assert!(bundle_path(bundle, Path::new("/etc/passwd")).is_err());
+        assert!(bundle_path(bundle, Path::new("")).is_err());
+
+        let root = std::env::temp_dir().join("omr-bundle-symlink-test");
+        let _ = std::fs::remove_dir_all(&root);
+        let real_bundle = root.join("bundle");
+        std::fs::create_dir_all(&real_bundle).unwrap();
+        let outside = root.join("outside");
+        std::fs::write(&outside, b"outside").unwrap();
+        std::os::unix::fs::symlink(&outside, real_bundle.join("escape")).unwrap();
+        assert!(bundle_path(&real_bundle, Path::new("escape")).is_err());
+    }
+
+    #[test]
     fn v3_rejected() {
         let dir = std::env::temp_dir().join("omr-test-v3");
         std::fs::create_dir_all(&dir).unwrap();
@@ -323,6 +408,7 @@ mod tests {
             aur_vendored: vec![VendoredPkg {
                 name: "foo".into(),
                 file: "aur-pkgs/foo.pkg.tar.zst".into(),
+                sha256: None,
             }],
         };
         let s = serde_json::to_string(&r).unwrap();

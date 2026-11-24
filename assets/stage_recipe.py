@@ -2,8 +2,11 @@
 # configs/airootfs/usr/share/omarchy-iso/orchestrator/phases_impl.py
 # by `omarchy-recipe build-iso`. No-op on ISOs without a recipe payload.
 #
-# Requires names already present in phases_impl.py: Path, shutil, subprocess,
-# info, and InstallContext (as `ctx`). Verified by omarchy-recipe's patch tests.
+# Requires only the upstream phase calling convention: stage_recipe(ctx),
+# where ctx.target is the mounted installation root.
+from pathlib import Path
+import shutil
+import subprocess
 
 RECIPE_LIVE_DIR = Path("/usr/share/omarchy-iso/recipe")
 RECIPE_TARGET_SUBDIR = "var/lib/omarchy/recipe"
@@ -22,7 +25,7 @@ def stage_recipe(ctx) -> None:
     if not src.is_dir() or not (src / "recipe.json").exists():
         return
 
-    info("› staging machine recipe for first boot")
+    print("› staging machine recipe for first boot", flush=True)
     dst = ctx.target / RECIPE_TARGET_SUBDIR
     if dst.exists():
         shutil.rmtree(dst)
@@ -32,6 +35,7 @@ def stage_recipe(ctx) -> None:
     bindst = ctx.target / "usr" / "local" / "bin" / RECIPE_BINARY_NAME
     bin_src = dst / RECIPE_BINARY_NAME
     if bin_src.exists():
+        bindst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(bin_src, bindst)
         bindst.chmod(0o755)
 
