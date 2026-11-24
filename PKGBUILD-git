@@ -3,7 +3,7 @@
 # omarchy-recipe-git; do not combine it with the stable PKGBUILD.
 
 pkgname=omarchy-recipe-git
-pkgver=0.2.0.r1795548291.g3dc58ff
+pkgver=0.2.0.r1795548638.g2867895
 pkgrel=1
 pkgdesc='Export, import, and bake portable Omarchy configuration recipes (git version)'
 arch=('x86_64')
