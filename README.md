@@ -620,6 +620,72 @@ omarchy-recipe export --out ./airgap.recipe \
 
 ---
 
+## Pacman and AUR packages
+
+The repository includes two package templates:
+
+| File | Package | Update model |
+|---|---|---|
+| `PKGBUILD` | `omarchy-recipe` | Stable: pinned to a specific commit until the maintainer updates it |
+| `PKGBUILD-git` | `omarchy-recipe-git` | Rolling: rebuilt from the latest `main` commit |
+
+### Stable vs rolling
+
+**Stable** is best for most users:
+
+- You receive a known, tested revision.
+- The package version changes only when the maintainer publishes an update.
+- Problems are easier to reproduce and support.
+- Fixes take longer to reach users because a new package release is required.
+
+**Rolling** is best for testers and contributors:
+
+- You receive new commits shortly after they are pushed.
+- There is no separate release step.
+- Untested changes can reach users immediately.
+- A broken upstream commit can temporarily break the package build.
+
+The two packages conflict with each other and the rolling package provides `omarchy-recipe`, so install only one.
+
+### Build the stable package locally
+
+```sh
+makepkg -si
+```
+
+This downloads the pinned source archive, verifies its checksum, builds the release binary, runs the tests, and installs the package.
+
+### Build the rolling package locally
+
+```sh
+makepkg -p PKGBUILD-git -si
+```
+
+### Publishing to the AUR
+
+The stable and rolling packages must live in separate AUR repositories:
+
+- `omarchy-recipe`
+- `omarchy-recipe-git`
+
+For the stable package:
+
+```sh
+makepkg --printsrcinfo > .SRCINFO
+```
+
+For the rolling package:
+
+```sh
+makepkg -p PKGBUILD-git --printsrcinfo > .SRCINFO
+```
+
+Copy each `PKGBUILD` and its generated `.SRCINFO` into the corresponding AUR repository. Do not publish both files in one AUR package repository.
+
+The stable `PKGBUILD` currently pins commit `3dc58ff56d7ab875e11b483a98d95752744bbf2f`. To publish a new stable version, update `pkgver`, `pkgrel`, the pinned commit, and the source checksum together.
+
+---
+
 ## Development
 
 Requirements:

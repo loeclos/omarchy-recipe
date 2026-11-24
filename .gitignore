@@ -1,3 +1,10 @@
 /target/
 *.recipe/
 release/
+
+# makepkg build artifacts
+/src/
+/pkg/
+/omarchy-recipe-*.tar.gz
+*.pkg.tar.zst
+*.pkg.tar.zst.sig
