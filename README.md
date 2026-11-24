@@ -640,7 +640,7 @@ Generate the package metadata:
 makepkg --printsrcinfo > .SRCINFO
 ```
 
-Copy `PKGBUILD` and `.SRCINFO` into the `omarchy-recipe` AUR repository.
+Copy `PKGBUILD`, `LICENSE`, and `.SRCINFO` into the `omarchy-recipe` AUR repository. The `LICENSE` file is required because the stable `PKGBUILD` lists it as a source file.
 
 The stable `PKGBUILD` currently pins commit `3dc58ff56d7ab875e11b483a98d95752744bbf2f`. To publish a new stable version, update `pkgver`, `pkgrel`, the pinned commit, and the source checksum together.
 
